@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+err=0
+
+if command -v shellcheck &>/dev/null; then
+  printf "shellcheck... "
+  shellcheck nmtrust.sh tests/migrant/test-nmtrust.sh && printf "ok\n" || err=1
+else
+  printf "shellcheck: not found, skipping\n"
+fi
+
+if command -v nixfmt &>/dev/null; then
+  printf "nixfmt... "
+  nix_files=$(find . -name '*.nix' -not -path './.beads/*')
+  if ! echo "$nix_files" | xargs nixfmt --check 2>/dev/null; then
+    echo "$nix_files" | xargs nixfmt
+    echo "$nix_files" | xargs git add
+    printf "reformatted and staged\n"
+  else
+    printf "ok\n"
+  fi
+else
+  printf "nixfmt: not found, skipping\n"
+fi
+
+exit "$err"

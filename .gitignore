@@ -1,0 +1,9 @@
+result
+.beads/
+.dolt/
+*.db
+.beads-credential-key
+.claude/
+AGENTS.md
+CLAUDE.md
+tests/migrant/workspace.img
