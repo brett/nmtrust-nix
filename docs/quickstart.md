@@ -58,9 +58,6 @@ services.nmtrust = {
 };
 ```
 
-> **Before nixpkgs merge:** You also need to add the flake input and import the
-> module. See the [README](../README.md#installation) for instructions.
-
 ## 3. Rebuild and verify
 
 ```bash

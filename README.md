@@ -53,27 +53,6 @@ The module and package are available in nixpkgs. No extra inputs needed.
 
 See [docs/quickstart.md](docs/quickstart.md) for a step-by-step setup guide.
 
-> **Before nixpkgs merge:** Add the flake as an input to use it now:
->
-> ```nix
-> # flake.nix
-> {
->   inputs = {
->     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
->     nmtrust.url = "github:brett/nmtrust-nix";
->   };
->
->   outputs = { nixpkgs, nmtrust, ... }: {
->     nixosConfigurations.my-machine = nixpkgs.lib.nixosSystem {
->       modules = [
->         nmtrust.nixosModules.default
->         ./configuration.nix
->       ];
->     };
->   };
-> }
-> ```
-
 ## Configuration
 
 ### Minimal example
@@ -430,6 +409,16 @@ migrant.sh destroy 2>/dev/null; migrant.sh up
 bash test-nmtrust.sh
 migrant.sh destroy
 ```
+
+## Releasing
+
+To publish a new version and update the nixpkgs package:
+
+1. Tag the release: `git tag v0.2.0 && git push --tags`
+2. In the nixpkgs tree, update `version` in `pkgs/by-name/nm/nmtrust/package.nix`
+   (`rev` derives from it automatically via `v${version}`)
+3. Clear the `hash` field and build — the error output shows the correct hash
+4. Commit with the nixpkgs convention: `nmtrust: 0.1.0 -> 0.2.0`
 
 ## Compared to nmtrust
 
