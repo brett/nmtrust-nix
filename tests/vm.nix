@@ -93,11 +93,11 @@ let
 
     def connect(machine, iface, profile):
         """Bring up an NM dummy connection. NM creates the interface itself."""
-        machine.succeed(f"nmcli connection up {profile}")
+        machine.succeed(f"nmcli connection up '{profile}'")
 
     def disconnect(machine, profile):
         """Disconnect an NM connection."""
-        machine.succeed(f"nmcli connection down {profile}")
+        machine.succeed(f"nmcli connection down '{profile}'")
 
     def wait_apply(machine):
         """Explicitly trigger apply and wait for it to finish.
@@ -544,7 +544,7 @@ in
   };
 
   # ══════════════════════════════════════════════════════════════════════
-  # vm-exclusions: V22, N4, N5
+  # vm-exclusions: V22, N4, N5, N6
   # Excluded connection handling and edge cases
   # ══════════════════════════════════════════════════════════════════════
   vm-exclusions = pkgs.testers.nixosTest {
@@ -555,7 +555,14 @@ in
         imports = [ baseConfig ];
 
         # N5: this UUID is trusted but will be used with a docker* name (excluded)
-        services.nmtrust.trustedUUIDsExtra = [ "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee" ];
+        # N6: this UUID is trusted but will be used with a multi-word name (excluded)
+        services.nmtrust.trustedUUIDsExtra = [
+          "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+          "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        ];
+
+        # N6: exclusion pattern requiring full multi-word name
+        services.nmtrust.excludedConnectionPatterns = [ "My Home*" ];
 
         # Add a profile with glob metacharacters in the name for N4
         networking.networkmanager.ensureProfiles.profiles.evil-net = {
@@ -568,6 +575,19 @@ in
           };
           ipv4.method = "manual";
           ipv4.addresses = "10.99.4.1/24";
+        };
+
+        # N6: multi-word connection name
+        networking.networkmanager.ensureProfiles.profiles.multi-word-net = {
+          connection = {
+            id = "My Home Network";
+            uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+            type = "dummy";
+            interface-name = "dummy-multiword";
+            autoconnect = "false";
+          };
+          ipv4.method = "manual";
+          ipv4.addresses = "10.99.6.1/24";
         };
       };
     testScript = helpers + ''
@@ -622,6 +642,28 @@ in
 
       # Exclusion takes precedence: the connection is ignored, so we are offline
       assert_target(machine, "offline")
+
+      machine.succeed("nmcli connection down docker-trusted")
+      wait_apply(machine)
+
+      # ── N6: Multi-word connection name exclusion ──────────────────────
+      # "My Home Network" is trusted by UUID and matches the "My Home*" pattern.
+      # The pattern requires the full name — if the name were truncated to "My"
+      # by the D-Bus parser, "My Home*" would not match and the connection would
+      # count as trusted rather than being excluded, producing "trusted" instead
+      # of "offline".
+      connect(machine, "dummy-multiword", "My Home Network")
+      wait_apply(machine)
+
+      # Exclusion takes precedence: all active connections excluded → offline
+      assert_target(machine, "offline")
+
+      # Full multi-word name must appear in state output and be labeled excluded
+      state_output = machine.succeed("nmtrust state")
+      assert "My Home Network" in state_output, \
+          f"Full multi-word name missing from state output: {state_output}"
+      assert "excluded" in state_output, \
+          f"Expected excluded label for multi-word connection: {state_output}"
     '';
   };
 
@@ -703,6 +745,12 @@ in
       machine.succeed("systemctl start nmtrust-apply.service")
       wait_apply(machine)
       machine.fail("su - nobody-test -c 'cat /run/nmtrust/state'")
+
+      # ── N3: nmtrust state and status work unprivileged ───────────────
+      # These subcommands are read-only (D-Bus queries + systemctl reads)
+      # and should not require root.
+      machine.succeed("su - nobody-test -c 'nmtrust state'")
+      machine.succeed("su - nobody-test -c 'nmtrust status'")
     '';
   };
 

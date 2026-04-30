@@ -118,9 +118,9 @@ query_active_connections() {
       return 1
     fi
 
-    # busctl output: s "value"
-    uuid=$(echo "$uuid_raw" | gawk '{ gsub(/"/, "", $2); print $2 }')
-    id=$(echo "$id_raw" | gawk '{ gsub(/"/, "", $2); print $2 }')
+    # busctl output: s "value"  (value may contain spaces)
+    uuid=$(echo "$uuid_raw" | gawk '{ sub(/^s "/, ""); sub(/"$/, ""); print }')
+    id=$(echo "$id_raw" | gawk '{ sub(/^s "/, ""); sub(/"$/, ""); print }')
 
     # Validate UUID format to catch D-Bus parsing failures
     if [[ ! "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
@@ -283,8 +283,6 @@ cmd_apply() {
 
 # ── Subcommand: state ───────────────────────────────────────────────
 cmd_state() {
-  require_root
-
   evaluate_trust
 
   # Determine active target
@@ -350,8 +348,6 @@ cmd_override() {
 
 # ── Subcommand: status ──────────────────────────────────────────────
 cmd_status() {
-  require_root
-
   local active_target="none"
   local t
   for t in trusted untrusted offline; do

@@ -573,7 +573,7 @@ test_m26() {
     vm_connect dummy-trusted trusted-net
     wait_apply
     local output
-    output=$(vm_root nmtrust state 2>&1)
+    output=$(vm nmtrust state 2>&1)
     echo "$output" | grep -qi "trusted" || return 1
     return 0
 }
@@ -583,7 +583,7 @@ test_m27() {
     vm_connect dummy-trusted trusted-net
     wait_apply
     local output
-    output=$(vm_root nmtrust status 2>&1)
+    output=$(vm nmtrust status 2>&1)
     # Should mention the target and/or canary state
     echo "$output" | grep -qi "trust" || return 1
     return 0

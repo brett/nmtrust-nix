@@ -64,10 +64,10 @@ services.nmtrust = {
 sudo nixos-rebuild switch
 
 # Check the current trust state
-sudo nmtrust state
+nmtrust state
 
 # See which target is active and what units are bound
-sudo nmtrust status
+nmtrust status
 ```
 
 ## 4. Test a transition
@@ -80,7 +80,7 @@ nmcli connection up home-wifi
 sleep 3
 
 # Verify
-sudo nmtrust state
+nmtrust state
 # State: trusted
 # Active target: nmtrust-trusted.target
 
@@ -91,7 +91,7 @@ sudo systemctl is-active mailsync.timer
 nmcli connection down home-wifi
 sleep 3
 
-sudo nmtrust state
+nmtrust state
 # State: offline
 # Active target: nmtrust-offline.target
 

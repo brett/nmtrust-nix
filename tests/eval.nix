@@ -658,13 +658,15 @@ in
     assert applySvc.NoNewPrivileges == true;
     assert applySvc.PrivateTmp == true;
     assert builtins.elem "/run/nmtrust" applySvc.ReadWritePaths;
+    assert applySvc.Restart == "on-failure";
     assert evalSvc.ProtectSystem == "strict";
     assert evalSvc.ProtectHome == true;
     assert evalSvc.NoNewPrivileges == true;
     assert evalSvc.PrivateTmp == true;
     assert builtins.elem "/run/nmtrust" evalSvc.ReadWritePaths;
+    assert evalSvc.Restart == "on-failure";
     pkgs.runCommand "eval-e18-service-hardening" { } ''
-      echo "PASS: systemd hardening directives present on both services"
+      echo "PASS: systemd hardening directives and retry policy present on both services"
       touch $out
     '';
 
@@ -679,6 +681,40 @@ in
     assert hasRestartTriggers;
     pkgs.runCommand "eval-e19-restart-triggers" { } ''
       echo "PASS: nmtrust-eval has restartTriggers for config changes"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E20: same unit under multiple users with differing allowOffline -> wantedBy unioned
+  # -----------------------------------------------------------------------
+  eval-e20-userunit-shared =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            users.users.alice = { isNormalUser = true; linger = true; };
+            users.users.bob = { isNormalUser = true; linger = true; };
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              userUnits.alice."syncthing.service" = { allowOffline = false; };
+              userUnits.bob."syncthing.service" = { allowOffline = true; };
+            };
+          }
+        )
+      ];
+      svc = cfg.systemd.user.services."syncthing";
+      wantedBy = svc.wantedBy;
+      hasTrusted = builtins.elem "nmtrust-trusted.target" wantedBy;
+      hasOffline = builtins.elem "nmtrust-offline.target" wantedBy;
+    in
+    assert hasTrusted;
+    assert hasOffline;
+    pkgs.runCommand "eval-e20-userunit-shared" { } ''
+      echo "PASS: shared unit wantedBy is the union of all users' declarations"
       touch $out
     '';
 }

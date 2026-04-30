@@ -161,7 +161,8 @@ If any assertion fails, the build stops with a clear, specific error message.
 
 ## CLI
 
-All commands require root.
+`state` and `status` are read-only and run unprivileged. `apply` and `override`
+write to `/run/nmtrust/` and require root.
 
 ### `nmtrust state`
 
@@ -169,7 +170,7 @@ Print the current trust state, active connections with their classification,
 override status, and which target is active.
 
 ```
-$ sudo nmtrust state
+$ nmtrust state
 State: trusted
 Override: none
 Active target: nmtrust-trusted.target
@@ -184,7 +185,7 @@ Show the active trust target and all units bound to each target with their
 current state.
 
 ```
-$ sudo nmtrust status
+$ nmtrust status
 Active target: nmtrust-trusted.target
 
 === nmtrust-trusted.target ===
@@ -293,7 +294,7 @@ structured data, eliminating injection risks.
 
 | Threat | Mitigation |
 |---|---|
-| Trust manipulation | `/run/nmtrust/` is `0700 root:root`. Override file is `0600`. All CLI commands require root. |
+| Trust manipulation | `/run/nmtrust/` is `0700 root:root`. Override file is `0600`. Write commands (`apply`, `override`) require root; read-only commands (`state`, `status`) are unprivileged. |
 | Connection name injection | D-Bus API returns structured data (no text parsing). Connection names are only used for exclusion filtering via `fnmatch`, never for trust decisions. Trust is UUID-based. |
 | Race conditions | All evaluation runs inside a serialized oneshot service. Dispatcher debounces with 1s delay. Targets use `Conflicts=` for atomic transitions. |
 | Linger side effects | Module asserts linger is explicitly enabled (not silently forced). Error message explains that linger causes all user services to become persistent. |
@@ -368,7 +369,7 @@ The project has three test levels:
 
 ### Level 1: Nix evaluation tests
 
-19 tests that validate module options, assertions, generated systemd
+20 tests that validate module options, assertions, generated systemd
 configuration, config file content, hardening directives, and restart
 triggers. Pure Nix — no VM, no root, no network.
 
