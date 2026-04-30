@@ -30,9 +30,12 @@ let
   # Generate Conflicts= for a target (all other trust targets)
   conflictsFor = target: map (t: "${t}.target") (builtins.filter (t: t != target) trustTargets);
 
-  # Uses StopWhenUnneeded instead of PartOf so that units shared across trust
-  # targets (e.g. allowOffline) aren't stopped mid-transition when the old
-  # target deactivates before the new one has claimed them.
+  # Uses StopWhenUnneeded instead of PartOf to avoid same-transaction
+  # issues: when transitioning between targets that both want a unit
+  # (e.g. offline -> trusted for allowOffline units), PartOf on the
+  # old target would stop the unit before WantedBy on the new target
+  # can restart it. StopWhenUnneeded only stops the unit when NO
+  # active target wants it.
   mkUnitOverrides =
     unitName: unitCfg:
     let
@@ -50,11 +53,11 @@ let
   dispatcherScript = pkgs.writeShellScript "nmtrust-dispatcher" ''
     case "$2" in
       up|down|vpn-up|vpn-down|connectivity-change)
-        ${pkgs.systemd}/bin/systemd-run \
+        ${config.systemd.package}/bin/systemd-run \
           --no-block \
           --on-active=1s \
           --unit=nmtrust-apply-debounce \
-          ${pkgs.systemd}/bin/systemctl start nmtrust-apply.service \
+          ${config.systemd.package}/bin/systemctl start nmtrust-apply.service \
           2>/dev/null || true
         ;;
     esac
@@ -75,7 +78,8 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = ''
-        List of NetworkManager profile names from ensureProfiles.
+        List of NetworkManager profile names from
+        networking.networkmanager.ensureProfiles.
         UUIDs are resolved at evaluation time.
       '';
     };
@@ -86,7 +90,8 @@ in
       );
       default = [ ];
       description = ''
-        Additional trusted connection UUIDs not managed via ensureProfiles.
+        Additional trusted connection UUIDs not managed via
+        networking.networkmanager.ensureProfiles.
         Must be valid UUID format.
       '';
     };
@@ -109,7 +114,8 @@ in
       ];
       default = "untrusted";
       description = ''
-        How to treat mixed trust state (some trusted, some untrusted).
+        How to treat mixed trust state (some connections trusted,
+        some untrusted).
       '';
     };
 
@@ -120,9 +126,9 @@ in
       ];
       default = "untrusted";
       description = ''
-        How to handle trust evaluation failures (D-Bus errors, NM unavailable).
-        "untrusted" (default): fail-closed, stop trusted-only units.
-        "offline": treat as offline, allowing units with allowOffline to run.
+        How to handle trust evaluation failures (D-Bus errors, NM
+        unavailable). "untrusted" (default) is fail-closed: trusted-only
+        units stop. "offline" allows units with allowOffline to run.
       '';
     };
 
@@ -132,7 +138,7 @@ in
           options.allowOffline = lib.mkOption {
             type = lib.types.bool;
             default = false;
-            description = "Whether this unit should run when offline.";
+            description = "Whether this unit should also run when offline.";
           };
         }
       );
@@ -150,12 +156,20 @@ in
             options.allowOffline = lib.mkOption {
               type = lib.types.bool;
               default = false;
-              description = "Whether this unit should run when offline.";
+              description = "Whether this unit should also run when offline.";
             };
           }
         )
       );
       default = { };
+      example = lib.literalExpression ''
+        {
+          alice = {
+            "etesync-dav.service" = { };
+            "syncthing.service" = { allowOffline = true; };
+          };
+        }
+      '';
       description = ''
         Per-user units to bind to the trusted network target.
         Outer keys are usernames, inner keys are systemd unit names.
@@ -170,7 +184,7 @@ in
 
   config = lib.mkIf cfg.enable {
 
-    # --- Assertions (FR2) ---
+    # --- Assertions ---
 
     assertions =
       # NetworkManager is required
@@ -188,7 +202,7 @@ in
             && config.networking.networkmanager.ensureProfiles.profiles.${name}.connection ? uuid;
           message =
             "services.nmtrust.trustedConnections references '${name}' "
-            + "but no matching ensureProfiles entry with a UUID exists.";
+            + "but no matching networking.networkmanager.ensureProfiles entry with a UUID exists.";
         }) cfg.trustedConnections)
       ++
         # userUnits -> user existence
@@ -235,13 +249,13 @@ in
         '';
     };
 
-    # --- tmpfiles.d (FR6) ---
+    # --- tmpfiles.d ---
 
     systemd.tmpfiles.rules = [
       "d /run/nmtrust 0700 root root -"
     ];
 
-    # --- System trust targets (FR3) ---
+    # --- System trust targets ---
 
     systemd.targets = lib.listToAttrs (
       map (target: {
@@ -260,7 +274,7 @@ in
       }) trustTargets
     );
 
-    # --- User trust targets (FR3) ---
+    # --- User trust targets ---
 
     systemd.user.targets = lib.listToAttrs (
       map (target: {
@@ -279,9 +293,9 @@ in
       }) trustTargets
     );
 
-    # --- System unit overrides + services (FR3, FR4, FR5) ---
+    # --- System unit overrides + services ---
 
-    # Strip .service/.timer/.socket suffixes from keys — NixOS appends them automatically
+    # Strip .service/.timer/.socket suffixes — NixOS appends them automatically
     systemd.services =
       lib.mapAttrs' (name: value: {
         name = lib.removeSuffix ".service" (lib.removeSuffix ".timer" (lib.removeSuffix ".socket" name));
@@ -329,11 +343,12 @@ in
         };
       };
 
-    # --- User unit overrides (FR3) ---
+    # --- User unit overrides ---
 
-    # When the same unit appears under multiple users, union their wantedBy lists.
-    # systemd.user.services is system-wide, so per-user allowOffline differences
-    # are resolved by taking the most permissive value (any true wins).
+    # When the same unit appears under multiple users, union their wantedBy
+    # lists. systemd.user.services is system-wide, so per-user allowOffline
+    # differences are resolved by taking the most permissive value (any
+    # true wins).
     systemd.user.services = lib.foldl' (
       acc: username:
       lib.foldl' (
@@ -359,7 +374,7 @@ in
       ) acc (builtins.attrNames cfg.userUnits.${username})
     ) { } userNames;
 
-    # --- NM dispatcher (FR4) ---
+    # --- NM dispatcher ---
 
     networking.networkmanager.dispatcherScripts = [
       {
