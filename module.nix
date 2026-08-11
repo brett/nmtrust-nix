@@ -101,6 +101,21 @@ let
   # "offline" to states.
   unitStates = unitCfg: lib.unique (unitCfg.states ++ lib.optional unitCfg.allowOffline "offline");
 
+  # Every binding that names the untrusted state, labelled for error
+  # messages. Used to reject the fail-open evalFailurePolicy combination.
+  untrustedBoundUnits =
+    lib.filter (n: builtins.elem "untrusted" (unitStates cfg.systemUnits.${n})) (
+      builtins.attrNames cfg.systemUnits
+    )
+    ++ lib.concatMap (
+      username:
+      map (n: "${username}:${n}") (
+        lib.filter (n: builtins.elem "untrusted" (unitStates cfg.userUnits.${username}.${n})) (
+          builtins.attrNames cfg.userUnits.${username}
+        )
+      )
+    ) userNames;
+
   # { "backup.timer" = [ states ]; ... }
   #   -> { timers = { backup = [ states ]; }; ... }
   # Two entries can land on the same unit (e.g. "foo" and "foo.service"),
@@ -355,8 +370,14 @@ in
       default = "untrusted";
       description = ''
         How to handle trust evaluation failures (D-Bus errors, NM
-        unavailable). "untrusted" (default) is fail-closed: trusted-only
-        units stop. "offline" allows units with allowOffline to run.
+        unavailable). "untrusted" (default) is fail-safe: trusted-only
+        units stop, and units bound to the untrusted state activate.
+        "offline" resolves to the offline state instead, allowing units
+        with `allowOffline` to run.
+
+        "offline" is rejected when any unit is bound to the untrusted
+        state, because it would stop those units on a failure — dropping
+        a VPN while you may still be on an untrusted network.
       '';
     };
 
@@ -430,6 +451,22 @@ in
             "services.nmtrust.trustedConnections references '${name}' "
             + "but no matching networking.networkmanager.ensureProfiles entry with a UUID exists.";
         }) cfg.trustedConnections)
+      ++
+        # evalFailurePolicy = "offline" is fail-open for untrusted-bound units
+        [
+          {
+            assertion = cfg.evalFailurePolicy != "offline" || untrustedBoundUnits == [ ];
+            message =
+              "services.nmtrust.evalFailurePolicy = \"offline\" cannot be combined with "
+              + "units bound to the untrusted state (${lib.concatStringsSep ", " untrustedBoundUnits}). "
+              + "On an evaluation failure the offline policy resolves to the offline state, "
+              + "which stops untrusted-bound units — so a transient D-Bus error would drop a "
+              + "VPN while you may still be on an untrusted network. That is fail-open, and "
+              + "it is the opposite of why the unit is bound to untrusted in the first place. "
+              + "Use the default evalFailurePolicy = \"untrusted\", which activates those units "
+              + "on failure instead.";
+          }
+        ]
       ++
         # userUnits -> user existence
         (map (username: {

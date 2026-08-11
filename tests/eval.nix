@@ -1125,4 +1125,229 @@ in
       echo "PASS: foreign-dep check resolves against the unit's own option set"
       touch $out
     '';
+
+  # -----------------------------------------------------------------------
+  # E31: user units route by type too — systemd.user.timers/sockets/paths,
+  # not everything into systemd.user.services.
+  # -----------------------------------------------------------------------
+  eval-e31-user-unit-type-routing =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            users.users.alice = {
+              isNormalUser = true;
+              linger = true;
+            };
+            systemd.user.timers.backup = {
+              timerConfig.OnCalendar = "hourly";
+              wantedBy = [ "timers.target" ];
+            };
+            systemd.user.services.backup.serviceConfig.ExecStart = "/bin/true";
+            systemd.user.sockets.ipc.listenStreams = [ "4321" ];
+            systemd.user.paths.inbox.pathConfig.PathExists = "/tmp/inbox";
+
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              userUnits.alice = {
+                "backup.timer" = { };
+                "ipc.socket" = {
+                  states = [ "untrusted" ];
+                };
+                "inbox.path" = {
+                  allowOffline = true;
+                };
+              };
+            };
+          }
+        )
+      ];
+    in
+    assert builtins.all (a: a.assertion) cfg.assertions;
+    assert cfg.systemd.user.timers.backup.wantedBy == [ "nmtrust-trusted.target" ];
+    assert cfg.systemd.user.timers.backup.unitConfig.StopWhenUnneeded;
+    # The service the timer triggers must be untouched
+    assert cfg.systemd.user.services.backup.wantedBy == [ ];
+    assert cfg.systemd.user.sockets.ipc.wantedBy == [ "nmtrust-untrusted.target" ];
+    assert builtins.elem "nmtrust-offline.target" cfg.systemd.user.paths.inbox.wantedBy;
+    pkgs.runCommand "eval-e31-user-unit-type-routing" { } ''
+      echo "PASS: user units route to systemd.user.{timers,sockets,paths}"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E32: states (not just allowOffline) are unioned when two users name
+  # the same unit — systemd.user.* is system-wide, so it is one unit.
+  # -----------------------------------------------------------------------
+  eval-e32-user-states-union =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            users.users.alice = {
+              isNormalUser = true;
+              linger = true;
+            };
+            users.users.bob = {
+              isNormalUser = true;
+              linger = true;
+            };
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              userUnits.alice."syncthing.service" = {
+                states = [ "trusted" ];
+              };
+              userUnits.bob."syncthing.service" = {
+                states = [ "untrusted" ];
+                allowOffline = true;
+              };
+            };
+          }
+        )
+      ];
+      wantedBy = cfg.systemd.user.services.syncthing.wantedBy;
+    in
+    assert builtins.elem "nmtrust-trusted.target" wantedBy;
+    assert builtins.elem "nmtrust-untrusted.target" wantedBy;
+    assert builtins.elem "nmtrust-offline.target" wantedBy;
+    # Union, not duplication
+    assert builtins.length wantedBy == 3;
+    pkgs.runCommand "eval-e32-user-states-union" { } ''
+      echo "PASS: states are unioned across users naming the same unit"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E33: evalFailurePolicy = "offline" is rejected alongside any
+  # untrusted-bound unit. On an eval failure the offline policy stops
+  # those units — dropping a VPN while still on an untrusted network.
+  # -----------------------------------------------------------------------
+  eval-e33-offline-policy-restricted =
+    let
+      withPolicy =
+        policy: units:
+        assertionsPassing [
+          sampleProfileModule
+          (
+            { config, ... }:
+            {
+              services.nmtrust = {
+                enable = true;
+                trustedConnections = [ "home-wifi" ];
+                evalFailurePolicy = policy;
+                systemUnits = units;
+              };
+            }
+          )
+        ];
+
+      userWithPolicy =
+        policy: states:
+        assertionsPassing [
+          sampleProfileModule
+          (
+            { config, ... }:
+            {
+              users.users.alice = {
+                isNormalUser = true;
+                linger = true;
+              };
+              services.nmtrust = {
+                enable = true;
+                trustedConnections = [ "home-wifi" ];
+                evalFailurePolicy = policy;
+                userUnits.alice."vpn.service" = { inherit states; };
+              };
+            }
+          )
+        ];
+    in
+    # Rejected: offline policy + untrusted-bound system unit
+    assert
+      !(withPolicy "offline" {
+        "vpn.service" = {
+          states = [ "untrusted" ];
+        };
+      });
+    # Rejected via the userUnits path too
+    assert !(userWithPolicy "offline" [ "untrusted" ]);
+    # Allowed: offline policy with no untrusted binding
+    assert withPolicy "offline" {
+      "sync.service" = {
+        allowOffline = true;
+      };
+    };
+    assert userWithPolicy "offline" [ "trusted" ];
+    # Allowed: untrusted bindings under the default fail-safe policy
+    assert withPolicy "untrusted" {
+      "vpn.service" = {
+        states = [ "untrusted" ];
+      };
+    };
+    pkgs.runCommand "eval-e33-offline-policy-restricted" { } ''
+      echo "PASS: offline evalFailurePolicy rejected alongside untrusted-bound units"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E34: the Mullvad + Tailscale recipe from docs/quickstart.md evaluates
+  # and binds what the docs claim. Guards against the documented config
+  # rotting when nixpkgs renames packages or reworks either module.
+  # -----------------------------------------------------------------------
+  eval-e34-documented-vpn-recipe =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, pkgs, ... }:
+          {
+            services.mullvad-vpn.enable = true;
+            services.tailscale.enable = true;
+
+            systemd.services.mullvad-connect = {
+              after = [ "mullvad-daemon.service" ];
+              wants = [ "mullvad-daemon.service" ];
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                ExecStart = "${pkgs.mullvad}/bin/mullvad connect --wait";
+                ExecStop = "${pkgs.mullvad}/bin/mullvad disconnect --wait";
+              };
+            };
+
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              excludedConnectionPatterns = [
+                "wg-mullvad*"
+                "tun*"
+                "tailscale*"
+              ];
+              systemUnits."mullvad-connect.service" = {
+                states = [ "untrusted" ];
+              };
+            };
+          }
+        )
+      ];
+    in
+    assert builtins.all (a: a.assertion) cfg.assertions;
+    # The wrapper is trust-bound...
+    assert cfg.systemd.services.mullvad-connect.wantedBy == [ "nmtrust-untrusted.target" ];
+    # ...and the daemons are deliberately left alone, per the docs
+    assert cfg.systemd.services.mullvad-daemon.wantedBy == [ "multi-user.target" ];
+    assert cfg.systemd.services.tailscaled.wantedBy == [ "multi-user.target" ];
+    pkgs.runCommand "eval-e34-documented-vpn-recipe" { } ''
+      echo "PASS: documented Mullvad+Tailscale recipe evaluates and binds correctly"
+      touch $out
+    '';
 }

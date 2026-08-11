@@ -141,7 +141,7 @@ users.users.brett.linger = true;
 | `trustedUUIDsExtra` | list of UUID str | `[]` | Additional trusted UUIDs (format-validated). |
 | `excludedConnectionPatterns` | list of str | `[]` | Glob patterns for connections to ignore. Matched via `fnmatch(3)` with `FNM_NOESCAPE`. |
 | `mixedPolicy` | `"trusted"` or `"untrusted"` | `"untrusted"` | How to resolve mixed trust state. |
-| `evalFailurePolicy` | `"untrusted"` or `"offline"` | `"untrusted"` | How to resolve evaluation failures. |
+| `evalFailurePolicy` | `"untrusted"` or `"offline"` | `"untrusted"` | How to resolve evaluation failures. `"offline"` is rejected alongside untrusted-bound units — see below. |
 | `systemUnits` | attrs of submodule | `{}` | System units to bind to the trust targets. Keys are unit names; `.service`, `.timer`, `.socket` and `.path` are supported. |
 | `systemUnits.<name>.states` | list of `"trusted"` / `"untrusted"` / `"offline"` | `[ "trusted" ]` | Trust states the unit runs in. Must be non-empty. |
 | `systemUnits.<name>.allowOffline` | bool | `false` | Shorthand for adding `"offline"` to `states`. |
@@ -171,6 +171,27 @@ to lock yourself off the network — are in
 Whatever VPN you bind, bind a small wrapper unit rather than the daemon itself,
 and add the tunnel interface to `excludedConnectionPatterns` so it does not feed
 back into the trust state that started it.
+
+### Evaluation failures and untrusted-bound units
+
+When trust evaluation fails (NetworkManager down, D-Bus error), `evalFailurePolicy`
+decides which state to fall back to. Adding untrusted-bound units changes what
+that choice means:
+
+| Policy | Falls back to | trusted-only units | untrusted-bound units |
+|---|---|---|---|
+| `"untrusted"` (default) | untrusted | stop | **start** |
+| `"offline"` | offline | stop | **stop** |
+
+The default is fail-safe in both directions: a failure stops units that need a
+trusted network and starts the VPN that exists for untrusted ones.
+
+`"offline"` is fail-open for the second column — a transient D-Bus error would
+drop your VPN while you may still be sitting on a hostile network, which is the
+opposite of why the unit was bound to `untrusted`. The module therefore
+**rejects `evalFailurePolicy = "offline"` at build time** when any unit is bound
+to the untrusted state. If you need the offline fallback, keep untrusted-bound
+units out of that configuration.
 
 ### Binding units that another module already enables
 

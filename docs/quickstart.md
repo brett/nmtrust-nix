@@ -129,6 +129,10 @@ unit can actually stop — replacing every other `wantedBy` it had. If a bound
 unit still refuses to stop, some *other* unit is likely pulling it in with
 `Wants=`/`Requires=`; check with `systemctl list-dependencies --reverse <unit>`.
 
+Note that `evalFailurePolicy = "offline"` is rejected once any unit is bound to
+`untrusted`: on an evaluation failure it would stop the VPN while you may still
+be on a hostile network. The default `"untrusted"` policy starts it instead.
+
 Two rules apply to every VPN you manage this way:
 
 1. **Bind a wrapper unit, not the daemon.** Stopping `mullvad-daemon` or

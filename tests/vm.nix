@@ -297,6 +297,9 @@ in
 
       assert_target(machine, "trusted")
       assert_running(machine, "trust-test-canary.service")
+      # V26: an override drives untrusted-bound units too — forcing
+      # trusted while physically on an untrusted network stops the VPN.
+      assert_stopped(machine, "trust-test-untrusted-canary.service")
 
       # ── V8: Override clear ────────────────────────────────────────────
       machine.succeed("nmtrust override clear")
@@ -305,6 +308,8 @@ in
       # Should return to computed state (untrusted, since only untrusted-net is up)
       assert_target(machine, "untrusted")
       assert_stopped(machine, "trust-test-canary.service")
+      # V27: clearing the override brings it back
+      assert_running(machine, "trust-test-untrusted-canary.service")
 
       # ── V17: Malformed override file ──────────────────────────────────
       # Write garbage to the override file
@@ -400,6 +405,14 @@ in
       {
         imports = [ baseConfig ];
         services.nmtrust.evalFailurePolicy = lib.mkForce "offline";
+        # The offline policy is rejected alongside untrusted-bound units
+        # (it would stop them on a failure), so drop those bindings here.
+        services.nmtrust.systemUnits = lib.mkForce {
+          "trust-test-canary.service" = { };
+          "trust-test-offline-canary.service" = {
+            allowOffline = true;
+          };
+        };
       };
     testScript = helpers + ''
       # ── Setup: establish a known state first ──────────────────────────
@@ -417,6 +430,9 @@ in
 
       assert_target(failUntrusted, "untrusted")
       assert_stopped(failUntrusted, "trust-test-canary.service")
+      # V25: the default policy is fail-SAFE for untrusted-bound units —
+      # an eval failure brings them up rather than dropping them.
+      assert_running(failUntrusted, "trust-test-untrusted-canary.service")
       failUntrusted.succeed("journalctl -u nmtrust-apply.service --no-pager -o cat | grep -q EVAL_FAILURE")
 
       # ── V14: evalFailurePolicy = "offline" ────────────────────────────
