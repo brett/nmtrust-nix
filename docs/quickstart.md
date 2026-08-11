@@ -125,8 +125,9 @@ services.nmtrust.systemUnits = {
 
 If the unit is one another module already enables (most are, via
 `wantedBy = [ "multi-user.target" ]`), nmtrust overrides that `WantedBy=` so the
-unit can actually stop. Registering a unit here hands its whole start/stop
-lifecycle to the trust state.
+unit can actually stop — replacing every other `wantedBy` it had. If a bound
+unit still refuses to stop, some *other* unit is likely pulling it in with
+`Wants=`/`Requires=`; check with `systemctl list-dependencies --reverse <unit>`.
 
 Two rules apply to every VPN you manage this way:
 
@@ -159,12 +160,16 @@ services.nmtrust = {
 };
 ```
 
-> **Do not enable Mullvad's lockdown mode with this setup.**
-> `mullvad lockdown-mode set on` blocks *all* network access whenever the VPN is
-> disconnected. Since nmtrust disconnects Mullvad on trusted networks, lockdown
-> mode would leave you with no connectivity at all on your own LAN. Keep
-> lockdown mode off, or leave Mullvad permanently connected and unmanaged by
-> nmtrust — the two features solve the same problem in incompatible ways.
+> **Mullvad's lockdown mode conflicts with this setup.**
+> `mullvad lockdown-mode set on` requires a VPN connection in order to reach the
+> internet, so it blocks ordinary internet access whenever the VPN is
+> disconnected. Since nmtrust disconnects Mullvad on trusted networks, that is
+> exactly when you would be left without it. Two categories are exempt and keep
+> working: traffic from split-tunnelled applications, and local network traffic
+> if `mullvad lan set allow` is on — so this is a loss of general internet
+> access, not a total blackout. Either keep lockdown mode off, or leave Mullvad
+> permanently connected and unmanaged by nmtrust; the two features solve the
+> same problem in incompatible ways.
 
 Mullvad's auto-connect setting (`mullvad auto-connect set on`) is likewise
 redundant here and will fight the trust binding. Leave it off.
@@ -217,12 +222,15 @@ Three interactions to be aware of:
 - **Allow LAN.** Set `mullvad lan set allow`. With LAN sharing blocked, Mullvad
   also blocks the local subnet, which breaks Tailscale's direct peer discovery
   and any local services.
-- **Tailscale falls back to relays.** With Mullvad connected, Tailscale's
-  peer-to-peer traffic egresses through the Mullvad tunnel, so direct
-  connections usually fail and Tailscale drops back to DERP relays. It still
-  works; it is slower. `mullvad split-tunnel add <PID>` can exclude `tailscaled`
-  from the tunnel, but it is keyed on PID and is lost whenever `tailscaled`
-  restarts, so it is not something to wire into a unit.
+- **Expect degraded Tailscale connectivity.** Tailscale documents that running
+  alongside another VPN often needs workarounds, because of firewall rules,
+  address conflicts, or platform limits. Here the likely outcome is that direct
+  peer-to-peer connections fail and Tailscale falls back to DERP relays — it
+  keeps working, but slower. Verify rather than assume: check `tailscale status`
+  for `relay` vs `direct`, and `tailscale ping <peer>`. `mullvad split-tunnel
+  add <PID>` can exclude `tailscaled` from the tunnel, but it is keyed on PID
+  and lost whenever `tailscaled` restarts, so it is not worth wiring into a
+  unit.
 - **One default route at a time.** Do not use a Tailscale exit node while
   Mullvad is connected — both want the default route and the result depends on
   ordering. Tailscale's built-in Mullvad exit nodes are the supported way to get

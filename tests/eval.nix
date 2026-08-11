@@ -961,4 +961,168 @@ in
       echo "PASS: requiredBy/upheldBy dependencies fail the assertion, clean units pass"
       touch $out
     '';
+
+  # -----------------------------------------------------------------------
+  # E27: each unit type is routed to the option set that owns it.
+  # A .timer entry must bind systemd.timers.<name>, NOT the .service it
+  # triggers — otherwise the timer keeps firing in every trust state and
+  # starts the service directly, bypassing the binding entirely.
+  # -----------------------------------------------------------------------
+  eval-e27-unit-type-routing =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            systemd.timers.mailsync = {
+              timerConfig.OnCalendar = "hourly";
+              wantedBy = [ "timers.target" ];
+            };
+            systemd.services.mailsync.serviceConfig.ExecStart = "/bin/true";
+            systemd.sockets.myapp.listenStreams = [ "1234" ];
+            systemd.paths.watcher.pathConfig.PathExists = "/tmp/x";
+            systemd.services.bare.serviceConfig.ExecStart = "/bin/true";
+
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              systemUnits = {
+                "mailsync.timer" = { };
+                "myapp.socket" = {
+                  states = [ "untrusted" ];
+                };
+                "watcher.path" = {
+                  allowOffline = true;
+                };
+                "bare" = { }; # no suffix -> service
+              };
+            };
+          }
+        )
+      ];
+      trusted = [ "nmtrust-trusted.target" ];
+    in
+    assert builtins.all (a: a.assertion) cfg.assertions;
+    # The timer is bound...
+    assert cfg.systemd.timers.mailsync.wantedBy == trusted;
+    assert cfg.systemd.timers.mailsync.unitConfig.StopWhenUnneeded;
+    # ...and the service it triggers is NOT touched by the timer entry
+    assert cfg.systemd.services.mailsync.wantedBy == [ ];
+    assert (cfg.systemd.services.mailsync.unitConfig.StopWhenUnneeded or null) == null;
+    # Sockets and paths route to their own option sets
+    assert cfg.systemd.sockets.myapp.wantedBy == [ "nmtrust-untrusted.target" ];
+    assert builtins.elem "nmtrust-offline.target" cfg.systemd.paths.watcher.wantedBy;
+    # A bare name is still treated as a service
+    assert cfg.systemd.services.bare.wantedBy == trusted;
+    pkgs.runCommand "eval-e27-unit-type-routing" { } ''
+      echo "PASS: .timer/.socket/.path/bare names route to the correct option sets"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E28: unit types nmtrust cannot bind are rejected, and a dot inside a
+  # unit name is not mistaken for a type suffix.
+  # -----------------------------------------------------------------------
+  eval-e28-unit-type-validation =
+    let
+      withUnit =
+        unitName:
+        assertionsPassing [
+          sampleProfileModule
+          (
+            { config, ... }:
+            {
+              services.nmtrust = {
+                enable = true;
+                trustedConnections = [ "home-wifi" ];
+                systemUnits.${unitName} = { };
+              };
+            }
+          )
+        ];
+    in
+    # .target / .mount / .slice have no nmtrust binding semantics
+    assert !(withUnit "graphical.target");
+    assert !(withUnit "data.mount");
+    assert !(withUnit "user.slice");
+    # A dotted service name is not a ".resolve1" unit
+    assert withUnit "dbus-org.freedesktop.resolve1";
+    assert withUnit "dbus-org.freedesktop.resolve1.service";
+    # Degenerate names: nothing before the suffix, or nothing at all
+    assert !(withUnit ".timer");
+    assert !(withUnit ".service");
+    assert !(withUnit "");
+    pkgs.runCommand "eval-e28-unit-type-validation" { } ''
+      echo "PASS: unbindable types and empty unit names rejected, dotted names accepted"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E30: a service whose name genuinely ends in another type's suffix can
+  # be disambiguated by spelling out .service — the documented escape
+  # hatch for the suffix heuristic.
+  # -----------------------------------------------------------------------
+  eval-e30-suffix-disambiguation =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            systemd.services."archive.timer".serviceConfig.ExecStart = "/bin/true";
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              systemUnits."archive.timer.service" = { };
+            };
+          }
+        )
+      ];
+    in
+    assert builtins.all (a: a.assertion) cfg.assertions;
+    # Bound the service literally named "archive.timer", not a timer
+    assert cfg.systemd.services."archive.timer".wantedBy == [ "nmtrust-trusted.target" ];
+    assert !(cfg.systemd.timers ? "archive");
+    pkgs.runCommand "eval-e30-suffix-disambiguation" { } ''
+      echo "PASS: .service suffix disambiguates a service named like another unit type"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E29: the foreign-dependency assertion resolves against the unit's own
+  # option set, so a .timer's requiredBy is checked on the timer.
+  # -----------------------------------------------------------------------
+  eval-e29-foreign-dep-per-type =
+    let
+      passes =
+        dep:
+        assertionsPassing [
+          sampleProfileModule
+          (
+            { config, ... }:
+            {
+              systemd.timers.mailsync = dep // {
+                timerConfig.OnCalendar = "hourly";
+              };
+              systemd.services.mailsync.serviceConfig.ExecStart = "/bin/true";
+              services.nmtrust = {
+                enable = true;
+                trustedConnections = [ "home-wifi" ];
+                systemUnits."mailsync.timer" = { };
+              };
+            }
+          )
+        ];
+    in
+    # requiredBy on the timer is caught
+    assert !(passes { requiredBy = [ "timers.target" ]; });
+    # plain wantedBy on the timer is fine — nmtrust force-overrides it
+    assert passes { wantedBy = [ "timers.target" ]; };
+    pkgs.runCommand "eval-e29-foreign-dep-per-type" { } ''
+      echo "PASS: foreign-dep check resolves against the unit's own option set"
+      touch $out
+    '';
 }

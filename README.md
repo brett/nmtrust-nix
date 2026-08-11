@@ -142,7 +142,7 @@ users.users.brett.linger = true;
 | `excludedConnectionPatterns` | list of str | `[]` | Glob patterns for connections to ignore. Matched via `fnmatch(3)` with `FNM_NOESCAPE`. |
 | `mixedPolicy` | `"trusted"` or `"untrusted"` | `"untrusted"` | How to resolve mixed trust state. |
 | `evalFailurePolicy` | `"untrusted"` or `"offline"` | `"untrusted"` | How to resolve evaluation failures. |
-| `systemUnits` | attrs of submodule | `{}` | System units to bind to the trust targets. Keys are unit names. |
+| `systemUnits` | attrs of submodule | `{}` | System units to bind to the trust targets. Keys are unit names; `.service`, `.timer`, `.socket` and `.path` are supported. |
 | `systemUnits.<name>.states` | list of `"trusted"` / `"untrusted"` / `"offline"` | `[ "trusted" ]` | Trust states the unit runs in. Must be non-empty. |
 | `systemUnits.<name>.allowOffline` | bool | `false` | Shorthand for adding `"offline"` to `states`. |
 | `userUnits` | attrs of attrs of submodule | `{}` | Per-user units. Outer key = username, inner key = unit name. |
@@ -180,15 +180,29 @@ Most units worth binding are declared elsewhere with
 that dependency would keep the unit running in every trust state and silently
 reduce the binding to a no-op.
 
-nmtrust therefore sets `wantedBy` with `lib.mkForce`, replacing any foreign
-`WantedBy=` with the trust targets. Registering a unit in `systemUnits` or
-`userUnits` hands its start/stop lifecycle to the trust state — including
-removing it from `multi-user.target`. Your own `wantedBy = lib.mkForce [ ]` is
-safe: equal-priority list definitions merge, so the trust binding survives.
+nmtrust therefore sets `wantedBy` with `lib.mkForce`, replacing the unit's
+entire `WantedBy=` with the trust targets. Treat this as a deliberate handover:
+registering a unit removes **every** other `wantedBy` it had, not just
+`multi-user.target` — a custom target, `timers.target`, or a module's own
+startup semantics go with it. Your own `wantedBy = lib.mkForce [ ]` is safe
+alongside it, because equal-priority list definitions merge rather than
+override, so the trust binding survives. A stronger priority
+(`lib.mkOverride 49`) would win and silently disable the binding.
 
 `requiredBy` and `upheldBy` are contributed to *other* units' `Requires=` and
 `Upholds=` and cannot be overridden from here. A bound unit carrying either one
 fails an assertion at build time rather than silently doing nothing.
+
+**This does not make the binding airtight.** `StopWhenUnneeded=` keeps a unit
+alive for *any* active unit that needs it, and a dependency declared in the
+other direction — some other unit's `wants`, `requires`, or `upholds` naming
+your bound unit — is invisible from the bound unit's own options and cannot be
+asserted on here. If a bound unit refuses to stop when the trust state changes,
+look for a `Wants=`/`Requires=` pointing at it:
+
+```bash
+systemctl list-dependencies --reverse <unit>
+```
 
 ### Build-time assertions
 
@@ -201,8 +215,11 @@ The module validates your config at `nixos-rebuild` time:
 - Each user in `userUnits` must exist in `users.users`
 - Each user in `userUnits` must have `linger = true` (the error message explains
   why and what side effects to expect)
-- No bound unit is pulled in by a foreign `requiredBy`/`upheldBy` that would
-  defeat `StopWhenUnneeded=`
+- Each bound unit names a bindable type (`.service`, `.timer`, `.socket`,
+  `.path`) and is not an empty name
+- No bound unit declares a `requiredBy`/`upheldBy` that would defeat
+  `StopWhenUnneeded=` (dependencies declared on *other* units cannot be checked
+  here — see above)
 
 If any assertion fails, the build stops with a clear, specific error message.
 

@@ -17,7 +17,7 @@ let
 
   userNames = builtins.attrNames cfg.userUnits;
 
-  # Unit names across all users, deduplicated: systemd.user.services is
+  # Unit names across all users, deduplicated: systemd.user.* is
   # system-wide, so the same unit named by two users is one unit.
   sharedUserUnitNames = lib.unique (
     lib.concatMap (username: builtins.attrNames cfg.userUnits.${username}) userNames
@@ -42,15 +42,112 @@ let
   # Generate Conflicts= for a target (all other trust targets)
   conflictsFor = target: map (t: "${t}.target") (builtins.filter (t: t != target) trustTargets);
 
-  # NixOS appends the .service/.timer/.socket suffix itself, so unit
-  # names given in systemUnits/userUnits are stripped before use as
-  # systemd.services attribute names.
-  stripUnitSuffix =
-    name: lib.removeSuffix ".service" (lib.removeSuffix ".timer" (lib.removeSuffix ".socket" name));
+  # Unit types nmtrust can bind, mapped to the NixOS option set that owns
+  # them. NixOS appends the type suffix itself, so "backup.timer" has to
+  # be routed to systemd.timers.backup — putting it in systemd.services
+  # would silently bind backup.service and leave the timer firing in
+  # every trust state.
+  unitTypeOptions = {
+    service = "services";
+    timer = "timers";
+    socket = "sockets";
+    path = "paths";
+  };
+
+  # Every unit type systemd knows. Used to tell a real type suffix apart
+  # from a dot inside a unit name (dbus-org.freedesktop.resolve1 must not
+  # be read as a ".resolve1" unit). No entry is a suffix of another, so
+  # at most one can match.
+  allUnitTypes = [
+    "service"
+    "socket"
+    "device"
+    "mount"
+    "automount"
+    "swap"
+    "target"
+    "path"
+    "timer"
+    "slice"
+    "scope"
+  ];
+
+  # "backup.timer" -> { type = "timer"; base = "backup"; optionSet = "timers"; }
+  # A name with no recognized type suffix is treated as a service, which
+  # is both the previous behaviour and NixOS's own convention for
+  # systemd.services attribute names. A unit whose name genuinely ends in
+  # another type's suffix can be disambiguated by spelling out .service
+  # ("archive.timer.service" -> systemd.services."archive.timer").
+  #
+  # `bindable` is false for unit types nmtrust cannot bind and for a name
+  # that is nothing but a suffix (".timer"). Both are rejected by an
+  # assertion and skipped when generating config.
+  splitUnitName =
+    name:
+    let
+      matched = builtins.filter (t: lib.hasSuffix ".${t}" name) allUnitTypes;
+      type = if matched == [ ] then "service" else builtins.head matched;
+      base = if matched == [ ] then name else lib.removeSuffix ".${type}" name;
+      optionSet = unitTypeOptions.${type} or null;
+    in
+    {
+      inherit type base optionSet;
+      bindable = optionSet != null && base != "";
+    };
+
+  bindableUnitTypes = builtins.attrNames unitTypeOptions;
 
   # States a unit entry resolves to; allowOffline is sugar for adding
   # "offline" to states.
   unitStates = unitCfg: lib.unique (unitCfg.states ++ lib.optional unitCfg.allowOffline "offline");
+
+  # { "backup.timer" = [ states ]; ... }
+  #   -> { timers = { backup = [ states ]; }; ... }
+  # Two entries can land on the same unit (e.g. "foo" and "foo.service"),
+  # so states are unioned rather than overwritten.
+  byOptionSet =
+    statesByName:
+    lib.foldl' (
+      acc: unitName:
+      let
+        u = splitUnitName unitName;
+        existing = acc.${u.optionSet} or { };
+      in
+      if !u.bindable then
+        acc
+      else
+        acc
+        // {
+          ${u.optionSet} = existing // {
+            ${u.base} = lib.unique ((existing.${u.base} or [ ]) ++ statesByName.${unitName});
+          };
+        }
+    ) { } (builtins.attrNames statesByName);
+
+  # systemUnits, grouped by the option set each unit belongs to.
+  systemUnitsByOptionSet = byOptionSet (lib.mapAttrs (_: unitStates) cfg.systemUnits);
+
+  # userUnits merged across users first — systemd.user.* is system-wide,
+  # so per-user differences in states/allowOffline are resolved by taking
+  # the most permissive value (the unit runs in any state some user
+  # asked for) — then grouped the same way.
+  userUnitsByOptionSet = byOptionSet (
+    lib.foldl' (
+      acc: username:
+      lib.foldl' (
+        acc': unitName:
+        acc'
+        // {
+          ${unitName} = lib.unique (
+            (acc'.${unitName} or [ ]) ++ unitStates cfg.userUnits.${username}.${unitName}
+          );
+        }
+      ) acc (builtins.attrNames cfg.userUnits.${username})
+    ) { } userNames
+  );
+
+  # Overrides for one option set, e.g. mkBoundUnits userUnitsByOptionSet "timers"
+  mkBoundUnits = grouped: optionSet: lib.mapAttrs (_: mkUnitOverrides) (grouped.${optionSet} or { });
 
   # Uses StopWhenUnneeded instead of PartOf to avoid same-transaction
   # issues: when transitioning between targets that both want a unit
@@ -130,6 +227,55 @@ let
         + "(nmtrust force-overrides wantedBy itself, so plain WantedBy= dependencies "
         + "from other modules need no action).";
     };
+
+  mkUnitNameAssertion =
+    { unitName, optionPath }:
+    let
+      u = splitUnitName unitName;
+    in
+    if u.base == "" then
+      {
+        assertion = false;
+        message = "${optionPath} has no unit name before the .${u.type} suffix.";
+      }
+    else
+      {
+        assertion = u.optionSet != null;
+        message =
+          "${optionPath} names a .${u.type} unit, which nmtrust cannot bind. "
+          + "Only ${lib.concatMapStringsSep ", " (t: ".${t}") bindableUnitTypes} units "
+          + "can be bound to a trust target. If this is a service whose name ends in "
+          + "\".${u.type}\", spell out the suffix: \"${unitName}.service\".";
+      };
+
+  # Assertions for one collection of unit names, resolved against the
+  # option set each unit actually belongs to (systemd.timers for a
+  # .timer, and so on).
+  mkUnitAssertions =
+    {
+      unitNames,
+      optionPathFor,
+      systemdPath,
+    }:
+    lib.concatMap (
+      unitName:
+      let
+        u = splitUnitName unitName;
+        optionPath = optionPathFor unitName;
+      in
+      [ (mkUnitNameAssertion { inherit unitName optionPath; }) ]
+      ++ lib.optional u.bindable (mkForeignDepAssertion {
+        unit = lib.getAttrFromPath (
+          systemdPath
+          ++ [
+            u.optionSet
+            u.base
+          ]
+        ) config;
+        inherit optionPath;
+        attrPath = "${lib.concatStringsSep "." systemdPath}.${u.optionSet}.${u.base}";
+      })
+    ) unitNames;
 
   # NM dispatcher script
   dispatcherScript = pkgs.writeShellScript "nmtrust-dispatcher" ''
@@ -220,14 +366,21 @@ in
       example = lib.literalExpression ''
         {
           "my-sync.service" = { };
+          "mailsync.timer" = { };
           "backup.service" = { allowOffline = true; };
-          "tailscale-up.service" = { states = [ "untrusted" ]; };
+          "mullvad-connect.service" = { states = [ "untrusted" ]; };
         }
       '';
       description = ''
         System units to bind to the trust targets. Keys are systemd unit
         names; each entry selects the trust states the unit runs in via
         {option}`states` (default `[ "trusted" ]`).
+
+        `.service`, `.timer`, `.socket` and `.path` units are supported,
+        and each is routed to the option set that owns it — a
+        `"backup.timer"` entry binds `systemd.timers.backup`, not the
+        service it triggers. A name with no type suffix is treated as a
+        `.service`.
       '';
     };
 
@@ -301,31 +454,23 @@ in
             + "persistently, not just trust-managed units.";
         }) (builtins.filter (u: config.users.users ? ${u}) userNames))
       ++
-        # systemUnits -> no foreign dependency defeating StopWhenUnneeded
-        (lib.mapAttrsToList (
-          unitName: _:
-          let
-            stripped = stripUnitSuffix unitName;
-          in
-          mkForeignDepAssertion {
-            unit = config.systemd.services.${stripped};
-            optionPath = "services.nmtrust.systemUnits.\"${unitName}\"";
-            attrPath = "systemd.services.${stripped}";
-          }
-        ) cfg.systemUnits)
+        # systemUnits -> bindable unit type, and no foreign dependency
+        # defeating StopWhenUnneeded
+        (mkUnitAssertions {
+          unitNames = builtins.attrNames cfg.systemUnits;
+          optionPathFor = unitName: "services.nmtrust.systemUnits.\"${unitName}\"";
+          systemdPath = [ "systemd" ];
+        })
       ++
-        # userUnits -> same check, deduplicated across users
-        (map (
-          unitName:
-          let
-            stripped = stripUnitSuffix unitName;
-          in
-          mkForeignDepAssertion {
-            unit = config.systemd.user.services.${stripped};
-            optionPath = "services.nmtrust.userUnits.*.\"${unitName}\"";
-            attrPath = "systemd.user.services.${stripped}";
-          }
-        ) sharedUserUnitNames);
+        # userUnits -> same checks, deduplicated across users
+        (mkUnitAssertions {
+          unitNames = sharedUserUnitNames;
+          optionPathFor = unitName: "services.nmtrust.userUnits.*.\"${unitName}\"";
+          systemdPath = [
+            "systemd"
+            "user"
+          ];
+        });
 
     # --- Helper package on PATH ---
 
@@ -394,77 +539,60 @@ in
 
     # --- System unit overrides + services ---
 
-    # Strip .service/.timer/.socket suffixes — NixOS appends them automatically
-    systemd.services =
-      lib.mapAttrs' (name: value: {
-        name = stripUnitSuffix name;
-        value = mkUnitOverrides (unitStates value);
-      }) cfg.systemUnits
-      // {
-        nmtrust-apply = {
-          description = "Evaluate and apply network trust state";
-          after = [ "NetworkManager.service" ];
-          serviceConfig = {
-            Type = "oneshot";
-            ExecStart = "${trustHelper}/bin/nmtrust apply";
-            Restart = "on-failure";
-            RestartSec = "5";
-            ProtectSystem = "strict";
-            ReadWritePaths = [ "/run/nmtrust" ];
-            ProtectHome = true;
-            NoNewPrivileges = true;
-            PrivateTmp = true;
-          };
-        };
-        nmtrust-eval = {
-          description = "Evaluate network trust state on boot";
-          wantedBy = [ "network-online.target" ];
-          wants = [ "network-online.target" ];
-          after = [
-            "NetworkManager.service"
-            "network-online.target"
-          ];
-          restartTriggers = [
-            config.environment.etc."nmtrust/config".source
-          ];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            ExecStart = "${trustHelper}/bin/nmtrust apply";
-            Restart = "on-failure";
-            RestartSec = "5";
-            ProtectSystem = "strict";
-            ReadWritePaths = [ "/run/nmtrust" ];
-            ProtectHome = true;
-            NoNewPrivileges = true;
-            PrivateTmp = true;
-          };
+    # Each bound unit is routed to the option set that owns its type;
+    # NixOS appends the type suffix back on.
+    systemd.timers = mkBoundUnits systemUnitsByOptionSet "timers";
+    systemd.sockets = mkBoundUnits systemUnitsByOptionSet "sockets";
+    systemd.paths = mkBoundUnits systemUnitsByOptionSet "paths";
+
+    systemd.services = mkBoundUnits systemUnitsByOptionSet "services" // {
+      nmtrust-apply = {
+        description = "Evaluate and apply network trust state";
+        after = [ "NetworkManager.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${trustHelper}/bin/nmtrust apply";
+          Restart = "on-failure";
+          RestartSec = "5";
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run/nmtrust" ];
+          ProtectHome = true;
+          NoNewPrivileges = true;
+          PrivateTmp = true;
         };
       };
+      nmtrust-eval = {
+        description = "Evaluate network trust state on boot";
+        wantedBy = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+        after = [
+          "NetworkManager.service"
+          "network-online.target"
+        ];
+        restartTriggers = [
+          config.environment.etc."nmtrust/config".source
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${trustHelper}/bin/nmtrust apply";
+          Restart = "on-failure";
+          RestartSec = "5";
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run/nmtrust" ];
+          ProtectHome = true;
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+        };
+      };
+    };
 
     # --- User unit overrides ---
 
-    # systemd.user.services is system-wide, so the same unit named by two
-    # users is one unit. Union the states each user asked for before
-    # building the overrides — the unit runs in any state some user wants.
-    systemd.user.services =
-      let
-        statesByUnit = lib.foldl' (
-          acc: username:
-          lib.foldl' (
-            acc': unitName:
-            let
-              strippedName = stripUnitSuffix unitName;
-              incoming = unitStates cfg.userUnits.${username}.${unitName};
-            in
-            acc'
-            // {
-              ${strippedName} = lib.unique ((acc'.${strippedName} or [ ]) ++ incoming);
-            }
-          ) acc (builtins.attrNames cfg.userUnits.${username})
-        ) { } userNames;
-      in
-      lib.mapAttrs (_: states: mkUnitOverrides states) statesByUnit;
+    systemd.user.services = mkBoundUnits userUnitsByOptionSet "services";
+    systemd.user.timers = mkBoundUnits userUnitsByOptionSet "timers";
+    systemd.user.sockets = mkBoundUnits userUnitsByOptionSet "sockets";
+    systemd.user.paths = mkBoundUnits userUnitsByOptionSet "paths";
 
     # --- NM dispatcher ---
 

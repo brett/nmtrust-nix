@@ -71,7 +71,17 @@ let
           "trust-test-untrusted-canary.service" = {
             states = [ "untrusted" ];
           };
+          "trust-test-canary.timer" = { };
         };
+      };
+
+      # A timer bound by name must bind the *timer*. Binding the service
+      # instead would leave the timer firing in every trust state and
+      # starting the service directly, bypassing the trust binding.
+      systemd.timers.trust-test-canary = {
+        description = "Trust test canary timer (trusted-only)";
+        wantedBy = [ "timers.target" ];
+        timerConfig.OnUnitActiveSec = "1h";
       };
 
       systemd.services.trust-test-canary = {
@@ -203,6 +213,9 @@ in
       # its upstream WantedBy=multi-user.target did not keep it running
       # through the trusted and offline states above.
       assert_running(machine, "trust-test-untrusted-canary.service")
+      # V23: a bound .timer stops with the trust state despite its own
+      # WantedBy=timers.target
+      assert_stopped(machine, "trust-test-canary.timer")
 
       # ── V4: Untrusted -> trusted ──────────────────────────────────────
       connect(machine, "dummy-trusted", "trusted-net")
@@ -214,6 +227,8 @@ in
       assert_running(machine, "trust-test-offline-canary.service")
       # V22: leaving the untrusted network stops it again
       assert_stopped(machine, "trust-test-untrusted-canary.service")
+      # V24: and the timer comes back with the trusted state
+      assert_running(machine, "trust-test-canary.timer")
     '';
   };
 
