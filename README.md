@@ -103,6 +103,7 @@ services.nmtrust = {
     "veth*"
     "br-*"
     "tailscale*"
+    "wg-mullvad*"
   ];
 
   # How to handle mixed state (some trusted, some not)
@@ -113,10 +114,11 @@ services.nmtrust = {
   # "untrusted" (default, fail-closed) or "offline"
   evalFailurePolicy = "untrusted";
 
-  # System units bound to the trusted target
+  # System units bound to the trust targets
   systemUnits = {
     "mailsync.timer" = {};                                    # trusted only
-    "restic-backup.service" = { allowOffline = true; };         # trusted + offline
+    "restic-backup.service" = { allowOffline = true; };       # trusted + offline
+    "mullvad-connect.service" = { states = [ "untrusted" ]; }; # untrusted only
   };
 
   # Per-user units (requires linger)
@@ -140,10 +142,53 @@ users.users.brett.linger = true;
 | `excludedConnectionPatterns` | list of str | `[]` | Glob patterns for connections to ignore. Matched via `fnmatch(3)` with `FNM_NOESCAPE`. |
 | `mixedPolicy` | `"trusted"` or `"untrusted"` | `"untrusted"` | How to resolve mixed trust state. |
 | `evalFailurePolicy` | `"untrusted"` or `"offline"` | `"untrusted"` | How to resolve evaluation failures. |
-| `systemUnits` | attrs of submodule | `{}` | System units to bind to the trusted target. Keys are unit names. |
-| `systemUnits.<name>.allowOffline` | bool | `false` | Also bind to the offline target. |
+| `systemUnits` | attrs of submodule | `{}` | System units to bind to the trust targets. Keys are unit names. |
+| `systemUnits.<name>.states` | list of `"trusted"` / `"untrusted"` / `"offline"` | `[ "trusted" ]` | Trust states the unit runs in. Must be non-empty. |
+| `systemUnits.<name>.allowOffline` | bool | `false` | Shorthand for adding `"offline"` to `states`. |
 | `userUnits` | attrs of attrs of submodule | `{}` | Per-user units. Outer key = username, inner key = unit name. |
-| `userUnits.<user>.<name>.allowOffline` | bool | `false` | Also bind to the offline target. |
+| `userUnits.<user>.<name>.states` | list of str | `[ "trusted" ]` | As above. |
+| `userUnits.<user>.<name>.allowOffline` | bool | `false` | As above. |
+
+### Choosing states
+
+`states` selects which trust states a unit runs in; it stops in every state not
+listed. The default `[ "trusted" ]` is the common case — a unit that should only
+touch the network on machines you control.
+
+The inverse, `states = [ "untrusted" ]`, is for units that exist *because* the
+network is not trusted: a VPN, a Tailscale bring-up unit, a stricter DNS
+resolver. Listing all three states means the unit always runs, which makes the
+binding pointless.
+
+`states` and `allowOffline` are unioned, so
+`{ states = [ "untrusted" ]; allowOffline = true; }` runs the unit on untrusted
+networks and while offline, but not on trusted ones.
+
+Worked examples for Mullvad, Tailscale, and both together — including two ways
+to lock yourself off the network — are in
+[docs/quickstart.md](docs/quickstart.md#run-a-service-only-on-untrusted-networks).
+
+Whatever VPN you bind, bind a small wrapper unit rather than the daemon itself,
+and add the tunnel interface to `excludedConnectionPatterns` so it does not feed
+back into the trust state that started it.
+
+### Binding units that another module already enables
+
+Most units worth binding are declared elsewhere with
+`wantedBy = [ "multi-user.target" ]`. Since nmtrust stops units with
+`StopWhenUnneeded=`, which only takes effect when nothing active needs the unit,
+that dependency would keep the unit running in every trust state and silently
+reduce the binding to a no-op.
+
+nmtrust therefore sets `wantedBy` with `lib.mkForce`, replacing any foreign
+`WantedBy=` with the trust targets. Registering a unit in `systemUnits` or
+`userUnits` hands its start/stop lifecycle to the trust state — including
+removing it from `multi-user.target`. Your own `wantedBy = lib.mkForce [ ]` is
+safe: equal-priority list definitions merge, so the trust binding survives.
+
+`requiredBy` and `upheldBy` are contributed to *other* units' `Requires=` and
+`Upholds=` and cannot be overridden from here. A bound unit carrying either one
+fails an assertion at build time rather than silently doing nothing.
 
 ### Build-time assertions
 
@@ -156,6 +201,8 @@ The module validates your config at `nixos-rebuild` time:
 - Each user in `userUnits` must exist in `users.users`
 - Each user in `userUnits` must have `linger = true` (the error message explains
   why and what side effects to expect)
+- No bound unit is pulled in by a foreign `requiredBy`/`upheldBy` that would
+  defeat `StopWhenUnneeded=`
 
 If any assertion fails, the build stops with a clear, specific error message.
 
@@ -251,9 +298,16 @@ Services are bound to targets via:
 - `WantedBy=` — systemd starts the service when the target activates
 - `StopWhenUnneeded=` — systemd stops the service when no active target wants it
 
-A service with `allowOffline = true` is bound to both
-`nmtrust-trusted.target` and `nmtrust-offline.target`. It runs on
-trusted networks and when offline, but stops on untrusted networks.
+A service is bound to one `nmtrust-<state>.target` per entry in its `states`
+list. With the default `[ "trusted" ]` plus `allowOffline = true`, it is bound
+to both `nmtrust-trusted.target` and `nmtrust-offline.target`: it runs on
+trusted networks and when offline, but stops on untrusted networks. With
+`states = [ "untrusted" ]` the binding is inverted — the unit runs only on
+untrusted networks.
+
+`WantedBy=` is set with `lib.mkForce` so that a `WantedBy=multi-user.target`
+from the module that defines the unit cannot keep it permanently "needed". See
+[Binding units that another module already enables](#binding-units-that-another-module-already-enables).
 
 ### Debouncing and serialization
 

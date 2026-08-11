@@ -112,6 +112,153 @@ services.nmtrust.systemUnits = {
 This binds the unit to both the trusted and offline targets. It stops only on
 untrusted networks.
 
+### Run a service only on untrusted networks
+
+The inverse case — a VPN or a stricter resolver that should come up precisely
+when you are on a network you do not control:
+
+```nix
+services.nmtrust.systemUnits = {
+  "mullvad-connect.service" = { states = [ "untrusted" ]; };
+};
+```
+
+If the unit is one another module already enables (most are, via
+`wantedBy = [ "multi-user.target" ]`), nmtrust overrides that `WantedBy=` so the
+unit can actually stop. Registering a unit here hands its whole start/stop
+lifecycle to the trust state.
+
+Two rules apply to every VPN you manage this way:
+
+1. **Bind a wrapper unit, not the daemon.** Stopping `mullvad-daemon` or
+   `tailscaled` tears down far more than the tunnel. A `RemainAfterExit` oneshot
+   that connects on start and disconnects on stop leaves the daemon alone.
+2. **Exclude the VPN's own interface** from trust evaluation, or the tunnel it
+   brings up feeds back into the state that started it. See
+   [Avoiding feedback loops](#avoiding-feedback-loops).
+
+### Example: Mullvad on untrusted networks
+
+```nix
+services.mullvad-vpn.enable = true;
+
+systemd.services.mullvad-connect = {
+  after = [ "mullvad-daemon.service" ];
+  wants = [ "mullvad-daemon.service" ];
+  serviceConfig = {
+    Type = "oneshot";
+    RemainAfterExit = true;
+    ExecStart = "${pkgs.mullvad}/bin/mullvad connect --wait";
+    ExecStop = "${pkgs.mullvad}/bin/mullvad disconnect --wait";
+  };
+};
+
+services.nmtrust = {
+  excludedConnectionPatterns = [ "wg-mullvad*" "tun*" ];
+  systemUnits."mullvad-connect.service" = { states = [ "untrusted" ]; };
+};
+```
+
+> **Do not enable Mullvad's lockdown mode with this setup.**
+> `mullvad lockdown-mode set on` blocks *all* network access whenever the VPN is
+> disconnected. Since nmtrust disconnects Mullvad on trusted networks, lockdown
+> mode would leave you with no connectivity at all on your own LAN. Keep
+> lockdown mode off, or leave Mullvad permanently connected and unmanaged by
+> nmtrust — the two features solve the same problem in incompatible ways.
+
+Mullvad's auto-connect setting (`mullvad auto-connect set on`) is likewise
+redundant here and will fight the trust binding. Leave it off.
+
+### Example: Tailscale
+
+Tailscale is usually the wrong thing to bind. It is an overlay network you reach
+*the machine* on, so stopping it on trusted networks means losing SSH and
+MagicDNS to your own laptop from your own tailnet. Prefer leaving `tailscaled`
+unmanaged and always on.
+
+If you do want it trust-driven, bind a wrapper rather than the daemon:
+
+```nix
+systemd.services.tailscale-up = {
+  after = [ "tailscaled.service" ];
+  wants = [ "tailscaled.service" ];
+  serviceConfig = {
+    Type = "oneshot";
+    RemainAfterExit = true;
+    ExecStart = "${pkgs.tailscale}/bin/tailscale up";
+    ExecStop = "${pkgs.tailscale}/bin/tailscale down";
+  };
+};
+
+services.nmtrust = {
+  excludedConnectionPatterns = [ "tailscale*" ];
+  systemUnits."tailscale-up.service" = { states = [ "untrusted" ]; };
+};
+```
+
+### Running Mullvad and Tailscale together
+
+The recommended split is **Mullvad trust-driven, Tailscale always on**. They
+have different jobs: Mullvad hides your traffic from the local network, while
+Tailscale is how you reach the machine. Only the first is a function of trust.
+
+```nix
+services.mullvad-vpn.enable = true;
+services.tailscale.enable = true;          # deliberately not in systemUnits
+
+services.nmtrust = {
+  excludedConnectionPatterns = [ "wg-mullvad*" "tun*" "tailscale*" ];
+  systemUnits."mullvad-connect.service" = { states = [ "untrusted" ]; };
+};
+```
+
+Three interactions to be aware of:
+
+- **Allow LAN.** Set `mullvad lan set allow`. With LAN sharing blocked, Mullvad
+  also blocks the local subnet, which breaks Tailscale's direct peer discovery
+  and any local services.
+- **Tailscale falls back to relays.** With Mullvad connected, Tailscale's
+  peer-to-peer traffic egresses through the Mullvad tunnel, so direct
+  connections usually fail and Tailscale drops back to DERP relays. It still
+  works; it is slower. `mullvad split-tunnel add <PID>` can exclude `tailscaled`
+  from the tunnel, but it is keyed on PID and is lost whenever `tailscaled`
+  restarts, so it is not something to wire into a unit.
+- **One default route at a time.** Do not use a Tailscale exit node while
+  Mullvad is connected — both want the default route and the result depends on
+  ordering. Tailscale's built-in Mullvad exit nodes are the supported way to get
+  both, and need neither this setup nor the Mullvad client.
+
+If you nonetheless want both trust-driven, bind both and order them so the
+tunnels come up deterministically. Use `after` only — a `wants` or `requires`
+between them would make one unit "needed" by the other and prevent
+`StopWhenUnneeded=` from stopping it:
+
+```nix
+systemd.services.tailscale-up.after = [ "mullvad-connect.service" ];
+
+services.nmtrust.systemUnits = {
+  "mullvad-connect.service" = { states = [ "untrusted" ]; };
+  "tailscale-up.service" = { states = [ "untrusted" ]; };
+};
+```
+
+### Avoiding feedback loops
+
+A VPN that nmtrust starts creates a new interface. If NetworkManager manages it,
+it becomes an active connection and re-enters trust evaluation — the tunnel
+feeds back into the state that started it. Always exclude it:
+
+```nix
+services.nmtrust.excludedConnectionPatterns = [ "wg-mullvad*" "tun*" "tailscale*" ];
+```
+
+Excluding the interface is what makes this safe. The failure mode if you instead
+mark a trust-managed VPN's own connection as *trusted* while running
+`mixedPolicy = "trusted"` is a genuine oscillation: untrusted network → VPN
+starts → now trusted → VPN stops → untrusted again, repeating at the debounce
+interval. The default `mixedPolicy = "untrusted"` is stable, but exclusion is
+the real fix.
+
 ### Add user-level units
 
 User units require the target user to have lingering enabled:

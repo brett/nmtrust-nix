@@ -148,6 +148,24 @@ let
     )
   ];
 
+  # Reference config: system unit bound to untrusted only
+  untrustedRefConfig = evalConfig [
+    baseModule
+    sampleProfileModule
+    (
+      { config, ... }:
+      {
+        services.nmtrust = {
+          enable = true;
+          trustedConnections = [ "home-wifi" ];
+          systemUnits."my-vpn.service" = {
+            states = [ "untrusted" ];
+          };
+        };
+      }
+    )
+  ];
+
   # Disabled config
   disabledConfig = evalConfig [
     baseModule
@@ -695,13 +713,23 @@ in
         (
           { config, ... }:
           {
-            users.users.alice = { isNormalUser = true; linger = true; };
-            users.users.bob = { isNormalUser = true; linger = true; };
+            users.users.alice = {
+              isNormalUser = true;
+              linger = true;
+            };
+            users.users.bob = {
+              isNormalUser = true;
+              linger = true;
+            };
             services.nmtrust = {
               enable = true;
               trustedConnections = [ "home-wifi" ];
-              userUnits.alice."syncthing.service" = { allowOffline = false; };
-              userUnits.bob."syncthing.service" = { allowOffline = true; };
+              userUnits.alice."syncthing.service" = {
+                allowOffline = false;
+              };
+              userUnits.bob."syncthing.service" = {
+                allowOffline = true;
+              };
             };
           }
         )
@@ -715,6 +743,222 @@ in
     assert hasOffline;
     pkgs.runCommand "eval-e20-userunit-shared" { } ''
       echo "PASS: shared unit wantedBy is the union of all users' declarations"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E21: states = [ "untrusted" ] -> bound to untrusted only, NOT trusted
+  # -----------------------------------------------------------------------
+  eval-e21-untrusted-only =
+    let
+      svc = untrustedRefConfig.systemd.services."my-vpn";
+      wantedBy = svc.wantedBy;
+    in
+    assert svc.unitConfig.StopWhenUnneeded;
+    assert builtins.elem "nmtrust-untrusted.target" wantedBy;
+    assert !(builtins.elem "nmtrust-trusted.target" wantedBy);
+    assert !(builtins.elem "nmtrust-offline.target" wantedBy);
+    pkgs.runCommand "eval-e21-untrusted-only" { } ''
+      echo "PASS: states=[untrusted] binds to untrusted target only"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E22: states and allowOffline are unioned, not exclusive
+  # -----------------------------------------------------------------------
+  eval-e22-states-union =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              systemUnits."my-vpn.service" = {
+                states = [ "untrusted" ];
+                allowOffline = true;
+              };
+            };
+          }
+        )
+      ];
+      wantedBy = cfg.systemd.services."my-vpn".wantedBy;
+    in
+    assert builtins.elem "nmtrust-untrusted.target" wantedBy;
+    assert builtins.elem "nmtrust-offline.target" wantedBy;
+    assert !(builtins.elem "nmtrust-trusted.target" wantedBy);
+    pkgs.runCommand "eval-e22-states-union" { } ''
+      echo "PASS: states and allowOffline are unioned"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E23: invalid / empty states -> type error at eval
+  # -----------------------------------------------------------------------
+  eval-e23-invalid-states =
+    let
+      badState = evalSucceeds [
+        (
+          { config, ... }:
+          {
+            services.nmtrust = {
+              enable = true;
+              systemUnits."my-vpn.service".states = [ "sometimes" ];
+            };
+          }
+        )
+      ];
+      emptyStates = evalSucceeds [
+        (
+          { config, ... }:
+          {
+            services.nmtrust = {
+              enable = true;
+              systemUnits."my-vpn.service".states = [ ];
+            };
+          }
+        )
+      ];
+    in
+    assert !badState;
+    assert !emptyStates;
+    pkgs.runCommand "eval-e23-invalid-states" { } ''
+      echo "PASS: invalid and empty states rejected at eval time"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E24: foreign wantedBy from another module is overridden, not inherited.
+  # Left in place it would keep the unit "needed" in every trust state and
+  # silently reduce the binding to a no-op.
+  # -----------------------------------------------------------------------
+  eval-e24-foreign-wantedby-overridden =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            # Stands in for an upstream module (e.g. services.tailscale)
+            # that enables the unit unconditionally.
+            systemd.services.my-sync = {
+              wantedBy = [ "multi-user.target" ];
+              serviceConfig.ExecStart = "/bin/true";
+            };
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              systemUnits."my-sync.service" = {
+                states = [ "untrusted" ];
+              };
+            };
+          }
+        )
+      ];
+      wantedBy = cfg.systemd.services."my-sync".wantedBy;
+    in
+    assert builtins.all (a: a.assertion) cfg.assertions;
+    assert wantedBy == [ "nmtrust-untrusted.target" ];
+    pkgs.runCommand "eval-e24-foreign-wantedby-overridden" { } ''
+      echo "PASS: foreign wantedBy is replaced by the trust targets"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E25: a user's own mkForce on wantedBy must not clobber the trust
+  # binding — equal-priority list definitions merge rather than override.
+  # -----------------------------------------------------------------------
+  eval-e25-user-mkforce-coexists =
+    let
+      cfg = evalConfig [
+        baseModule
+        sampleProfileModule
+        (
+          { config, lib, ... }:
+          {
+            systemd.services.my-sync = {
+              wantedBy = lib.mkForce [ ];
+              serviceConfig.ExecStart = "/bin/true";
+            };
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              systemUnits."my-sync.service" = { };
+            };
+          }
+        )
+      ];
+      wantedBy = cfg.systemd.services."my-sync".wantedBy;
+    in
+    assert wantedBy == [ "nmtrust-trusted.target" ];
+    pkgs.runCommand "eval-e25-user-mkforce-coexists" { } ''
+      echo "PASS: user mkForce [] does not clobber the trust binding"
+      touch $out
+    '';
+
+  # -----------------------------------------------------------------------
+  # E26: requiredBy/upheldBy cannot be overridden from the module, so they
+  # must fail loudly instead of silently defeating StopWhenUnneeded.
+  # Covers system units, user units, and the clean case.
+  # -----------------------------------------------------------------------
+  eval-e26-foreign-required-by =
+    let
+      withSystemDep =
+        dep:
+        assertionsPassing [
+          sampleProfileModule
+          (
+            { config, ... }:
+            {
+              systemd.services.my-sync = dep // {
+                serviceConfig.ExecStart = "/bin/true";
+              };
+              services.nmtrust = {
+                enable = true;
+                trustedConnections = [ "home-wifi" ];
+                systemUnits."my-sync.service" = { };
+              };
+            }
+          )
+        ];
+
+      requiredByFails = withSystemDep { requiredBy = [ "multi-user.target" ]; };
+      upheldByFails = withSystemDep { upheldBy = [ "multi-user.target" ]; };
+      cleanPasses = withSystemDep { };
+
+      # The same check applies to user units
+      userFails = assertionsPassing [
+        sampleProfileModule
+        (
+          { config, ... }:
+          {
+            users.users.alice = {
+              isNormalUser = true;
+              linger = true;
+            };
+            systemd.user.services.syncthing = {
+              requiredBy = [ "default.target" ];
+              serviceConfig.ExecStart = "/bin/true";
+            };
+            services.nmtrust = {
+              enable = true;
+              trustedConnections = [ "home-wifi" ];
+              userUnits.alice."syncthing.service" = { };
+            };
+          }
+        )
+      ];
+    in
+    assert !requiredByFails;
+    assert !upheldByFails;
+    assert !userFails;
+    assert cleanPasses;
+    pkgs.runCommand "eval-e26-foreign-required-by" { } ''
+      echo "PASS: requiredBy/upheldBy dependencies fail the assertion, clean units pass"
       touch $out
     '';
 }

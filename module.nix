@@ -17,18 +17,40 @@ let
 
   userNames = builtins.attrNames cfg.userUnits;
 
+  # Unit names across all users, deduplicated: systemd.user.services is
+  # system-wide, so the same unit named by two users is one unit.
+  sharedUserUnitNames = lib.unique (
+    lib.concatMap (username: builtins.attrNames cfg.userUnits.${username}) userNames
+  );
+
   # Build the helper package (reads config from /etc/nmtrust/config at runtime)
   trustHelper = pkgs.callPackage ./package.nix { };
 
-  # Trust target names
-  trustTargets = [
-    "nmtrust-trusted"
-    "nmtrust-untrusted"
-    "nmtrust-offline"
+  # Trust states, and the target names derived from them
+  trustStates = [
+    "trusted"
+    "untrusted"
+    "offline"
   ];
+
+  trustTargets = map (state: "nmtrust-${state}") trustStates;
+
+  # Fully-qualified target unit names, used to tell nmtrust's own
+  # dependencies apart from foreign ones in assertions.
+  trustTargetUnits = map (t: "${t}.target") trustTargets;
 
   # Generate Conflicts= for a target (all other trust targets)
   conflictsFor = target: map (t: "${t}.target") (builtins.filter (t: t != target) trustTargets);
+
+  # NixOS appends the .service/.timer/.socket suffix itself, so unit
+  # names given in systemUnits/userUnits are stripped before use as
+  # systemd.services attribute names.
+  stripUnitSuffix =
+    name: lib.removeSuffix ".service" (lib.removeSuffix ".timer" (lib.removeSuffix ".socket" name));
+
+  # States a unit entry resolves to; allowOffline is sugar for adding
+  # "offline" to states.
+  unitStates = unitCfg: lib.unique (unitCfg.states ++ lib.optional unitCfg.allowOffline "offline");
 
   # Uses StopWhenUnneeded instead of PartOf to avoid same-transaction
   # issues: when transitioning between targets that both want a unit
@@ -36,17 +58,77 @@ let
   # old target would stop the unit before WantedBy on the new target
   # can restart it. StopWhenUnneeded only stops the unit when NO
   # active target wants it.
-  mkUnitOverrides =
-    unitName: unitCfg:
+  #
+  # wantedBy is mkForce'd for two reasons. Most units worth binding are
+  # already `wantedBy = [ "multi-user.target" ]` in the module that
+  # defines them; left in place, that keeps the unit "needed" in every
+  # trust state and silently reduces the binding to a no-op. Forcing it
+  # also means a user's own `wantedBy = lib.mkForce [ ]` merges with this
+  # definition at equal priority (list definitions at the winning
+  # priority are concatenated) instead of clobbering the trust binding.
+  mkUnitOverrides = states: {
+    unitConfig.StopWhenUnneeded = true;
+    wantedBy = lib.mkForce (map (state: "nmtrust-${state}.target") states);
+  };
+
+  # Options shared by systemUnits and userUnits entries.
+  unitSubmodule = lib.types.submodule {
+    options = {
+      states = lib.mkOption {
+        type = lib.types.nonEmptyListOf (lib.types.enum trustStates);
+        default = [ "trusted" ];
+        example = [ "untrusted" ];
+        description = ''
+          Trust states in which this unit should run. The unit is bound to
+          the corresponding `nmtrust-<state>.target`s and stops in every
+          state not listed.
+
+          The default `[ "trusted" ]` runs the unit only on trusted
+          networks. Use `[ "untrusted" ]` for the inverse case — a unit
+          that should run only on networks you do not control, such as a
+          VPN or Tailscale bring-up unit. Listing all three states means
+          the unit always runs, which makes the binding pointless.
+        '';
+      };
+
+      allowOffline = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Whether this unit should also run when offline. Shorthand for
+          adding `"offline"` to {option}`states`; the two are unioned.
+        '';
+      };
+    };
+  };
+
+  # StopWhenUnneeded= only stops a unit when nothing *active* needs it.
+  # Foreign wantedBy is handled by mkForce above, but requiredBy and
+  # upheldBy are contributed to other units' Requires=/Upholds= and
+  # cannot be overridden from here — they keep the unit running in every
+  # trust state and silently reduce the binding to a no-op. Catch them at
+  # eval time rather than letting the binding quietly do nothing.
+  foreignDeps = unit: lib.subtractLists trustTargetUnits (unit.requiredBy ++ unit.upheldBy);
+
+  mkForeignDepAssertion =
+    {
+      unit,
+      optionPath,
+      attrPath,
+    }:
     let
-      targets = [
-        "nmtrust-trusted.target"
-      ]
-      ++ lib.optional unitCfg.allowOffline "nmtrust-offline.target";
+      foreign = foreignDeps unit;
     in
     {
-      unitConfig.StopWhenUnneeded = true;
-      wantedBy = targets;
+      assertion = foreign == [ ];
+      message =
+        "${optionPath} is also pulled in by ${lib.concatStringsSep ", " foreign} "
+        + "via requiredBy/upheldBy. nmtrust stops units with StopWhenUnneeded=, which "
+        + "only takes effect when nothing active needs the unit, so it would stay "
+        + "running in every trust state and the trust binding would have no effect. "
+        + "Clear the other dependency, e.g. ${attrPath}.requiredBy = lib.mkForce [ ]; "
+        + "(nmtrust force-overrides wantedBy itself, so plain WantedBy= dependencies "
+        + "from other modules need no action).";
     };
 
   # NM dispatcher script
@@ -133,45 +215,36 @@ in
     };
 
     systemUnits = lib.mkOption {
-      type = lib.types.attrsOf (
-        lib.types.submodule {
-          options.allowOffline = lib.mkOption {
-            type = lib.types.bool;
-            default = false;
-            description = "Whether this unit should also run when offline.";
-          };
-        }
-      );
+      type = lib.types.attrsOf unitSubmodule;
       default = { };
+      example = lib.literalExpression ''
+        {
+          "my-sync.service" = { };
+          "backup.service" = { allowOffline = true; };
+          "tailscale-up.service" = { states = [ "untrusted" ]; };
+        }
+      '';
       description = ''
-        System units to bind to the trusted network target.
-        Keys are systemd unit names.
+        System units to bind to the trust targets. Keys are systemd unit
+        names; each entry selects the trust states the unit runs in via
+        {option}`states` (default `[ "trusted" ]`).
       '';
     };
 
     userUnits = lib.mkOption {
-      type = lib.types.attrsOf (
-        lib.types.attrsOf (
-          lib.types.submodule {
-            options.allowOffline = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = "Whether this unit should also run when offline.";
-            };
-          }
-        )
-      );
+      type = lib.types.attrsOf (lib.types.attrsOf unitSubmodule);
       default = { };
       example = lib.literalExpression ''
         {
           alice = {
             "etesync-dav.service" = { };
             "syncthing.service" = { allowOffline = true; };
+            "personal-vpn.service" = { states = [ "untrusted" ]; };
           };
         }
       '';
       description = ''
-        Per-user units to bind to the trusted network target.
+        Per-user units to bind to the trust targets.
         Outer keys are usernames, inner keys are systemd unit names.
         Users must have linger enabled (users.users.<name>.linger = true).
       '';
@@ -226,7 +299,33 @@ in
             + "ensure the user's systemd instance is running for trust-based unit management. "
             + "Note: enabling linger causes ALL of this user's enabled user services to run "
             + "persistently, not just trust-managed units.";
-        }) (builtins.filter (u: config.users.users ? ${u}) userNames));
+        }) (builtins.filter (u: config.users.users ? ${u}) userNames))
+      ++
+        # systemUnits -> no foreign dependency defeating StopWhenUnneeded
+        (lib.mapAttrsToList (
+          unitName: _:
+          let
+            stripped = stripUnitSuffix unitName;
+          in
+          mkForeignDepAssertion {
+            unit = config.systemd.services.${stripped};
+            optionPath = "services.nmtrust.systemUnits.\"${unitName}\"";
+            attrPath = "systemd.services.${stripped}";
+          }
+        ) cfg.systemUnits)
+      ++
+        # userUnits -> same check, deduplicated across users
+        (map (
+          unitName:
+          let
+            stripped = stripUnitSuffix unitName;
+          in
+          mkForeignDepAssertion {
+            unit = config.systemd.user.services.${stripped};
+            optionPath = "services.nmtrust.userUnits.*.\"${unitName}\"";
+            attrPath = "systemd.user.services.${stripped}";
+          }
+        ) sharedUserUnitNames);
 
     # --- Helper package on PATH ---
 
@@ -298,8 +397,8 @@ in
     # Strip .service/.timer/.socket suffixes — NixOS appends them automatically
     systemd.services =
       lib.mapAttrs' (name: value: {
-        name = lib.removeSuffix ".service" (lib.removeSuffix ".timer" (lib.removeSuffix ".socket" name));
-        value = mkUnitOverrides name value;
+        name = stripUnitSuffix name;
+        value = mkUnitOverrides (unitStates value);
       }) cfg.systemUnits
       // {
         nmtrust-apply = {
@@ -345,34 +444,27 @@ in
 
     # --- User unit overrides ---
 
-    # When the same unit appears under multiple users, union their wantedBy
-    # lists. systemd.user.services is system-wide, so per-user allowOffline
-    # differences are resolved by taking the most permissive value (any
-    # true wins).
-    systemd.user.services = lib.foldl' (
-      acc: username:
-      lib.foldl' (
-        acc': unitName:
-        let
-          strippedName = lib.removeSuffix ".service" (
-            lib.removeSuffix ".timer" (lib.removeSuffix ".socket" unitName)
-          );
-          incoming = mkUnitOverrides unitName cfg.userUnits.${username}.${unitName};
-          existing = acc'.${strippedName} or null;
-        in
-        acc'
-        // {
-          ${strippedName} =
-            if existing == null then
-              incoming
-            else
-              existing
-              // {
-                wantedBy = lib.unique (existing.wantedBy ++ incoming.wantedBy);
-              };
-        }
-      ) acc (builtins.attrNames cfg.userUnits.${username})
-    ) { } userNames;
+    # systemd.user.services is system-wide, so the same unit named by two
+    # users is one unit. Union the states each user asked for before
+    # building the overrides — the unit runs in any state some user wants.
+    systemd.user.services =
+      let
+        statesByUnit = lib.foldl' (
+          acc: username:
+          lib.foldl' (
+            acc': unitName:
+            let
+              strippedName = stripUnitSuffix unitName;
+              incoming = unitStates cfg.userUnits.${username}.${unitName};
+            in
+            acc'
+            // {
+              ${strippedName} = lib.unique ((acc'.${strippedName} or [ ]) ++ incoming);
+            }
+          ) acc (builtins.attrNames cfg.userUnits.${username})
+        ) { } userNames;
+      in
+      lib.mapAttrs (_: states: mkUnitOverrides states) statesByUnit;
 
     # --- NM dispatcher ---
 

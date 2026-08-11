@@ -68,6 +68,9 @@ let
           "trust-test-offline-canary.service" = {
             allowOffline = true;
           };
+          "trust-test-untrusted-canary.service" = {
+            states = [ "untrusted" ];
+          };
         };
       };
 
@@ -80,6 +83,17 @@ let
       };
       systemd.services.trust-test-offline-canary = {
         description = "Trust test canary (trusted + offline)";
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        };
+      };
+      systemd.services.trust-test-untrusted-canary = {
+        description = "Trust test canary (untrusted-only, e.g. a VPN)";
+        # Deliberately declared the way an upstream module would declare
+        # it. nmtrust must override this, or StopWhenUnneeded never fires
+        # and the unit runs in every trust state.
+        wantedBy = [ "multi-user.target" ];
         serviceConfig = {
           Type = "simple";
           ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
@@ -165,6 +179,7 @@ in
       assert_stopped(machine, "trust-test-canary.service")
       # allowOffline canary should be running in offline state
       assert_running(machine, "trust-test-offline-canary.service")
+      assert_stopped(machine, "trust-test-untrusted-canary.service")
 
       # ── V1: Bring up trusted connection ───────────────────────────────
       connect(machine, "dummy-trusted", "trusted-net")
@@ -173,6 +188,7 @@ in
       assert_target(machine, "trusted")
       assert_running(machine, "trust-test-canary.service")
       assert_running(machine, "trust-test-offline-canary.service")
+      assert_stopped(machine, "trust-test-untrusted-canary.service")
 
       # ── V3: Trusted -> untrusted ──────────────────────────────────────
       # Disconnect trusted, bring up untrusted
@@ -183,6 +199,10 @@ in
       assert_target(machine, "untrusted")
       assert_stopped(machine, "trust-test-canary.service")
       assert_stopped(machine, "trust-test-offline-canary.service")
+      # V21: the inverse binding — runs only on untrusted networks, and
+      # its upstream WantedBy=multi-user.target did not keep it running
+      # through the trusted and offline states above.
+      assert_running(machine, "trust-test-untrusted-canary.service")
 
       # ── V4: Untrusted -> trusted ──────────────────────────────────────
       connect(machine, "dummy-trusted", "trusted-net")
@@ -192,6 +212,8 @@ in
       assert_target(machine, "trusted")
       assert_running(machine, "trust-test-canary.service")
       assert_running(machine, "trust-test-offline-canary.service")
+      # V22: leaving the untrusted network stops it again
+      assert_stopped(machine, "trust-test-untrusted-canary.service")
     '';
   };
 
