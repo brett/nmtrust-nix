@@ -356,7 +356,16 @@ in
         fnmatch(3) with FNM_NOESCAPE. Connection names are treated as
         literal strings (no backslash interpretation).
         Matching connections are ignored when computing trust state.
+
+        Loopback is always ignored and needs no entry here. A VPN tunnel
+        does, so that it cannot feed back into the trust state that
+        started it.
       '';
+      example = [
+        "virbr*"
+        "docker*"
+        "tailscale0"
+      ];
     };
 
     mixedPolicy = lib.mkOption {
