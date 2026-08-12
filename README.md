@@ -507,11 +507,18 @@ migrant.sh destroy
 
 To publish a new version and update the nixpkgs package:
 
-1. Tag the release: `git tag v0.2.0 && git push --tags`
-2. In the nixpkgs tree, update `version` in `pkgs/by-name/nm/nmtrust/package.nix`
-   (`rev` derives from it automatically via `v${version}`)
-3. Clear the `hash` field and build — the error output shows the correct hash
-4. Commit with the nixpkgs convention: `nmtrust: 0.1.0 -> 0.2.0`
+1. Bump `version` in `package.nix` to match the version being tagged
+2. Tag the release: `git tag -a v0.2.0 && git push origin v0.2.0`
+3. In the nixpkgs tree, update both `version` and `rev` in
+   `pkgs/by-name/nm/nmtrust/package.nix` — the expression does not use
+   `finalAttrs`, so `rev` does not derive from `version`
+4. Clear the `hash` field and build — the error output shows the correct hash
+5. Port `module.nix` to `nixos/modules/services/networking/nmtrust.nix`,
+   substituting `trustHelper = pkgs.nmtrust;` for the `callPackage` line and
+   appending `meta.maintainers` at the bottom of the file
+6. Note any behavior changes in the current `nixos/doc/manual/release-notes/`
+   file, since the module ships in stable releases
+7. Commit with the nixpkgs convention: `nmtrust: 0.1.0 -> 0.2.0`
 
 ## Compared to nmtrust
 
