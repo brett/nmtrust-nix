@@ -497,6 +497,58 @@ in
       '';
 
   # -----------------------------------------------------------------------
+  # E35: Dispatcher surfaces unexpected scheduling failures. A debounce
+  # collision is expected and stays quiet; anything else must be reported.
+  # -----------------------------------------------------------------------
+  eval-e35-dispatcher-error-visibility =
+    let
+      dispatchers = refConfig.networking.networkmanager.dispatcherScripts;
+      scriptPath = (builtins.head dispatchers).source;
+    in
+    pkgs.runCommand "eval-e35-dispatcher-error-visibility"
+      {
+        script = scriptPath;
+      }
+      ''
+        if grep -q '2>/dev/null' "$script"; then
+          echo "FAIL: dispatcher still discards stderr wholesale"
+          exit 1
+        fi
+        if ! grep -q 'already exists' "$script"; then
+          echo "FAIL: dispatcher does not special-case the debounce collision"
+          exit 1
+        fi
+        if ! grep -q '>&2' "$script"; then
+          echo "FAIL: dispatcher never reports an unexpected failure"
+          exit 1
+        fi
+        echo "PASS: dispatcher distinguishes debounce collisions from real errors"
+        touch $out
+      '';
+
+  # -----------------------------------------------------------------------
+  # E36: Trust targets are started with --no-block. Guarded here because the
+  # failure is silent and only shows on a host that reaches trusted.
+  # -----------------------------------------------------------------------
+  eval-e36-target-start-no-block =
+    pkgs.runCommand "eval-e36-target-start-no-block"
+      {
+        helper = ../nmtrust.sh;
+      }
+      ''
+        if ! grep -qE 'systemctl start --no-block "\$target"' "$helper"; then
+          echo "FAIL: system trust target is started without --no-block"
+          exit 1
+        fi
+        if ! grep -qE 'systemctl --user -M "\$\{user\}@" start --no-block' "$helper"; then
+          echo "FAIL: user trust target is started without --no-block"
+          exit 1
+        fi
+        echo "PASS: trust targets are started with --no-block"
+        touch $out
+      '';
+
+  # -----------------------------------------------------------------------
   # E14: Generated /etc/nmtrust/config contains trusted UUIDs
   # -----------------------------------------------------------------------
   eval-e14-helper-uuids =

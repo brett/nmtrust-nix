@@ -49,6 +49,14 @@ is_trusted_uuid() {
   return 1
 }
 
+# ── Loopback ────────────────────────────────────────────────────────
+# NM manages lo, so it is active on every boot and never trusted. Counting it
+# forces the mixed branch on every host, which mixedPolicy resolves to
+# untrusted. Ignored unconditionally: omitting it from patterns is silent.
+is_loopback() {
+  [[ "$1" == "loopback" ]]
+}
+
 # ── Excluded connection check (fnmatch-style, FNM_NOESCAPE) ────────
 is_excluded() {
   local name="$1"
@@ -69,6 +77,7 @@ query_active_connections() {
   CONN_NAMES=()
   CONN_UUIDS=()
   CONN_PATHS=()
+  CONN_TYPES=()
 
   local raw
   if ! raw=$(busctl get-property \
@@ -118,9 +127,21 @@ query_active_connections() {
       return 1
     fi
 
+    # Type, used to ignore loopback. Not fatal if it fails: a missing type
+    # only leaves a connection counted, never silently drops one.
+    local type_raw type
+    if ! type_raw=$(busctl get-property \
+          org.freedesktop.NetworkManager \
+          "$path" \
+          org.freedesktop.NetworkManager.Connection.Active \
+          Type 2>&1); then
+      type_raw=''
+    fi
+
     # busctl output: s "value"  (value may contain spaces)
     uuid=$(echo "$uuid_raw" | gawk '{ sub(/^s "/, ""); sub(/"$/, ""); print }')
     id=$(echo "$id_raw" | gawk '{ sub(/^s "/, ""); sub(/"$/, ""); print }')
+    type=$(echo "$type_raw" | gawk '{ sub(/^s "/, ""); sub(/"$/, ""); print }')
 
     # Validate UUID format to catch D-Bus parsing failures
     if [[ ! "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
@@ -131,6 +152,7 @@ query_active_connections() {
     CONN_PATHS+=("$path")
     CONN_UUIDS+=("$uuid")
     CONN_NAMES+=("$id")
+    CONN_TYPES+=("$type")
   done <<< "$paths_str"
 
   return 0
@@ -208,7 +230,7 @@ evaluate_trust() {
   local i
 
   for (( i=0; i<total; i++ )); do
-    if is_excluded "${CONN_NAMES[$i]}"; then
+    if is_loopback "${CONN_TYPES[$i]-}" || is_excluded "${CONN_NAMES[$i]}"; then
       (( CONNECTIONS_EXCLUDED++ )) || true
     else
       active_names+=("${CONN_NAMES[$i]}")
@@ -249,13 +271,15 @@ activate_target() {
   local state="$1"
   local target="nmtrust-${state}.target"
 
-  # System target
-  systemctl start "$target"
+  # System target. --no-block because `systemctl start` waits for the whole
+  # transaction, so a bound backup or VPN would hold this oneshot open for
+  # its runtime and stall nixos-rebuild. State is already written above.
+  systemctl start --no-block "$target"
 
   # User targets
   local user
   for user in "${MANAGED_USERS[@]+"${MANAGED_USERS[@]}"}"; do
-    if ! systemctl --user -M "${user}@" start "$target" 2>&1; then
+    if ! systemctl --user -M "${user}@" start --no-block "$target" 2>&1; then
       log "USER_TARGET_FAILED user=$user target=$target"
     fi
   done
@@ -304,7 +328,7 @@ cmd_state() {
   local i
   for (( i=0; i<total; i++ )); do
     local label
-    if is_excluded "${CONN_NAMES[$i]}"; then
+    if is_loopback "${CONN_TYPES[$i]-}" || is_excluded "${CONN_NAMES[$i]}"; then
       label="excluded"
     elif is_trusted_uuid "${CONN_UUIDS[$i]}"; then
       label="trusted"

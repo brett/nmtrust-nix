@@ -139,7 +139,7 @@ users.users.brett.linger = true;
 | `enable` | bool | `false` | Enable network trust management |
 | `trustedConnections` | list of str | `[]` | NM profile names from `ensureProfiles`. UUIDs resolved at eval time. |
 | `trustedUUIDsExtra` | list of UUID str | `[]` | Additional trusted UUIDs (format-validated). |
-| `excludedConnectionPatterns` | list of str | `[]` | Glob patterns for connections to ignore. Matched via `fnmatch(3)` with `FNM_NOESCAPE`. |
+| `excludedConnectionPatterns` | list of str | `[]` | Glob patterns for connections to ignore. Matched via `fnmatch(3)` with `FNM_NOESCAPE`. Loopback is always ignored regardless of this setting. |
 | `mixedPolicy` | `"trusted"` or `"untrusted"` | `"untrusted"` | How to resolve mixed trust state. |
 | `evalFailurePolicy` | `"untrusted"` or `"offline"` | `"untrusted"` | How to resolve evaluation failures. `"offline"` is rejected alongside untrusted-bound units — see below. |
 | `systemUnits` | attrs of submodule | `{}` | System units to bind to the trust targets. Keys are unit names; `.service`, `.timer`, `.socket` and `.path` are supported. |
@@ -171,6 +171,11 @@ to lock yourself off the network — are in
 Whatever VPN you bind, bind a small wrapper unit rather than the daemon itself,
 and add the tunnel interface to `excludedConnectionPatterns` so it does not feed
 back into the trust state that started it.
+
+Loopback needs no such entry — it is ignored unconditionally. NetworkManager
+manages `lo` on current releases, so counting it would put every host in the
+mixed branch (one trusted network plus `lo`), which `mixedPolicy` resolves to
+untrusted by default, and the trusted target would never activate.
 
 ### Evaluation failures and untrusted-bound units
 
@@ -289,6 +294,10 @@ Active target: nmtrust-trusted.target
 Re-evaluate trust state and activate the appropriate target. This is what the
 NM dispatcher and boot service call. Normally you don't need to run this
 manually.
+
+It returns once the target transition is queued, not once the bound units have
+finished starting — otherwise a slow unit such as a backup would hold it open
+for its entire runtime and stall `nixos-rebuild`.
 
 ```
 $ sudo nmtrust apply

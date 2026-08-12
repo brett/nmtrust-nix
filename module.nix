@@ -296,12 +296,21 @@ let
   dispatcherScript = pkgs.writeShellScript "nmtrust-dispatcher" ''
     case "$2" in
       up|down|vpn-up|vpn-down|connectivity-change)
-        ${config.systemd.package}/bin/systemd-run \
+        # A debounce collision ("already exists") is expected -- the pending
+        # run evaluates current state, so it covers this event too. Anything
+        # else must reach the journal: discarding stderr wholesale made a
+        # dispatcher that had stopped scheduling look like a quiet network.
+        if ! err=$(${config.systemd.package}/bin/systemd-run \
           --no-block \
           --on-active=1s \
           --unit=nmtrust-apply-debounce \
           ${config.systemd.package}/bin/systemctl start nmtrust-apply.service \
-          2>/dev/null || true
+          2>&1); then
+          case "$err" in
+            *"already exists"*) ;;
+            *) echo "nmtrust: could not schedule apply after '$2': $err" >&2 ;;
+          esac
+        fi
         ;;
     esac
   '';

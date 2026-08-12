@@ -847,4 +847,107 @@ in
     '';
   };
 
+  # ══════════════════════════════════════════════════════════════════════
+  # vm-loopback: loopback must not count toward trust evaluation.
+  # Every other test lists "lo" as unmanaged, which is why this went
+  # unnoticed; this node deliberately leaves it managed.
+  # ══════════════════════════════════════════════════════════════════════
+  vm-loopback = pkgs.testers.nixosTest {
+    name = "vm-loopback";
+    nodes.machine =
+      { config, pkgs, ... }:
+      {
+        imports = [ baseConfig ];
+        # NOTE: no "lo" here, unlike baseConfig.
+        networking.networkmanager.unmanaged = lib.mkForce [
+          "eth0"
+          "eth1"
+        ];
+      };
+    testScript = helpers + ''
+      machine.wait_for_unit("multi-user.target")
+      machine.succeed("nmcli device set lo managed yes || true")
+
+      with subtest("loopback alone reads as offline, not untrusted"):
+          wait_apply(machine)
+          machine.succeed("systemctl is-active nmtrust-offline.target")
+          machine.fail("systemctl is-active nmtrust-untrusted.target")
+
+      with subtest("loopback does not force the mixed branch"):
+          connect(machine, "dummy-trusted", "trusted-net")
+          wait_apply(machine)
+          # The regression: lo counted as untrusted -> mixed -> untrusted.
+          machine.succeed("systemctl is-active nmtrust-trusted.target")
+          machine.succeed("systemctl is-active trust-test-canary.service")
+
+      with subtest("status labels loopback excluded"):
+          out = machine.succeed("nmtrust state")
+          assert "[excluded]" in out, f"loopback not labelled excluded:\n{out}"
+          machine.succeed(
+              "journalctl -u nmtrust-apply.service -g TRUST_TRANSITION "
+              "| tail -1 | grep -q 'connections_excluded=[1-9]'"
+          )
+    '';
+  };
+
+  # ══════════════════════════════════════════════════════════════════════
+  # vm-nonblocking: applying a state must not block on the units it pulls
+  # in. `systemctl start` waits for the whole transaction, and apply is a
+  # oneshot with no start timeout, so a slow unit stalls nixos-rebuild.
+  # ══════════════════════════════════════════════════════════════════════
+  vm-nonblocking = pkgs.testers.nixosTest {
+    name = "vm-nonblocking";
+    nodes.machine =
+      { config, pkgs, ... }:
+      {
+        imports = [ baseConfig ];
+
+        # Stands in for a restic backup: bound to trusted, slow to finish.
+        services.nmtrust.systemUnits."trust-test-slow.service" = { };
+        systemd.services.trust-test-slow = {
+          description = "Slow trusted-only unit";
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${pkgs.coreutils}/bin/sleep 30";
+          };
+        };
+      };
+    testScript = helpers + ''
+      import time as pytime
+
+      machine.wait_for_unit("multi-user.target")
+      machine.succeed("systemctl start nmtrust-apply.service")
+      wait_apply(machine)
+
+      with subtest("apply returns while a slow bound unit is still starting"):
+          connect(machine, "dummy-trusted", "trusted-net")
+          pytime.sleep(1)
+
+          start = pytime.monotonic()
+          machine.succeed("systemctl start nmtrust-apply.service")
+          elapsed = pytime.monotonic() - start
+          machine.log(f"apply returned in {elapsed:.2f}s")
+
+          # Blocking apply would return only after the 30s sleep.
+          assert elapsed < 15, (
+              f"apply blocked {elapsed:.1f}s on a bound unit -- "
+              "systemctl start is waiting for the transaction"
+          )
+
+      with subtest("the slow unit really was still starting"):
+          # Proves the assertion above was not vacuous.
+          machine.succeed(
+              "systemctl show trust-test-slow.service -p ActiveState --value "
+              "| grep -qx activating"
+          )
+
+      with subtest("the transition still completes"):
+          # The target stays `activating` until the slow unit finishes: apply
+          # no longer waits, but target activation still tracks its units.
+          machine.wait_until_succeeds("systemctl is-active trust-test-slow.service", timeout=60)
+          machine.wait_until_succeeds("systemctl is-active nmtrust-trusted.target", timeout=60)
+    '';
+  };
+
 }
